@@ -13,3 +13,5 @@ vendor/
 # 本地凭据 / 备忘，绝不入库（info 目录下带 token 的文件）
 info/*token*
 password
+# 本地发布助手，自己用，不入库
+scripts/publish-release.ps1
