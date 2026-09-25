@@ -12,3 +12,4 @@ vendor/
 .env.local
 # 本地凭据 / 备忘，绝不入库（info 目录下带 token 的文件）
 info/*token*
+password
