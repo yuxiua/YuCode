@@ -1,0 +1,48 @@
+{
+  "appId": "com.yu.code",
+  "productName": "Yu Code",
+  "directories": {
+    "output": "../yu_code-release"
+  },
+  "files": [
+    "dist/**/*",
+    "electron/**/*",
+    "extensions/**/*",
+    "pi-extensions/**/*"
+  ],
+  "npmRebuild": false,
+  "electronDist": "node_modules/electron/dist",
+  "extraResources": [
+    { "from": "vendor/pi", "to": "vendor/pi" },
+    { "from": "vendor/node", "to": "vendor/node" },
+    { "from": "vendor/pi-extensions.zip", "to": "vendor/pi-extensions.zip" }
+  ],
+  "win": {
+    "target": [
+      {
+        "target": "nsis",
+        "arch": ["x64"]
+      }
+    ],
+    "icon": "resources/icon.ico"
+  },
+  "fileAssociations": [],
+  "nsis": {
+    "oneClick": false,
+    "perMachine": false,
+    "allowToChangeInstallationDirectory": true,
+    "deleteAppDataOnUninstall": false,
+    "shortcutName": "Yu Code",
+    "createDesktopShortcut": true,
+    "createStartMenuShortcut": true,
+    "include": "build/installer.nsh"
+  },
+  "mac": {
+    "target": ["dmg"],
+    "category": "public.app-category.developer-tools"
+  },
+  "linux": {
+    "target": ["AppImage"],
+    "category": "Development"
+  }
+}

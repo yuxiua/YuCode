@@ -1,0 +1,131 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  /* 界面文字默认不可选中：按钮、菜单、标签这些点来点去的地方选中蓝块很碍事，
+     也避免 Ctrl+A 把整个界面文字都框进去。真正要复制的区域（输入框、代码编辑器、
+     终端、聊天正文）在下面单独放开。 */
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* 仅这些地方允许选择/复制文字。:where() 不产生优先级，
+   所以组件自己写的 user-select（例如 xterm 的 no-select）依然生效。 */
+:where(
+  input,
+  textarea,
+  [contenteditable='true'],
+  .cm-editor,
+  .cm-content,
+  .xterm,
+  .select-text
+) {
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #3a3a3a;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #4d4d4d;
+}
+
+/* Scan light animation for thinking state */
+@keyframes scan-light {
+  0% {
+    transform: translateX(-100%);
+    opacity: 0;
+  }
+  50% {
+    opacity: 1;
+  }
+  100% {
+    transform: translateX(100%);
+    opacity: 0;
+  }
+}
+
+.scan-light {
+  position: relative;
+  overflow: hidden;
+}
+.scan-light::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 50%;
+  height: 100%;
+  background: linear-gradient(90deg, transparent, rgba(137, 180, 250, 0.12), transparent);
+  animation: scan-light 2s ease-in-out infinite;
+}
+
+/* Shimmer effect */
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+.shimmer {
+  background: linear-gradient(90deg, #1c1c1c 25%, #2c2c2c 50%, #1c1c1c 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.5s ease-in-out infinite;
+}
+
+/* Pulse dot */
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.5; transform: scale(0.8); }
+}
+
+.pulse-dot {
+  animation: pulse-dot 1.5s ease-in-out infinite;
+}
+
+/* Text shimmer - 扫光效果用于"思考中"等进行中状态文字 */
+@keyframes text-shimmer {
+  0% { background-position: -100% 0; }
+  100% { background-position: 200% 0; }
+}
+
+.text-shimmer {
+  background: linear-gradient(90deg, currentColor 40%, rgba(255,255,255,0.6) 50%, currentColor 60%);
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  animation: text-shimmer 2s ease-in-out infinite;
+}
+
+/* Terminal selection */
+.xterm .xterm-selection div {
+  background-color: rgba(137, 180, 250, 0.3) !important;
+}
+
+/* Drag region for frameless window */
+.drag-region {
+  -webkit-app-region: drag;
+}
+.no-drag {
+  -webkit-app-region: no-drag;
+}

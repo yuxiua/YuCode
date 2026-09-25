@@ -1,0 +1,12 @@
+node_modules/
+dist/
+release/
+# 构建时下载的 Pi / 便携 Node，体积大且可重新生成，不入库
+vendor/
+.dev-port
+*.log
+.term-out.txt
+.term-err.txt
+.DS_Store
+.env
+.env.local

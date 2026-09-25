@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; font-src 'self' data:;" />
+    <title>Yu Code</title>
+    <!-- 内联关键样式：不等 JS/CSS 加载完成就先铺好底色，避免打开瞬间的黑屏/白屏 -->
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #141414;
+        color: #e7e4df;
+        overflow: hidden;
+      }
+      #app-splash {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 18px;
+        background: #141414;
+        font-family: Inter, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif;
+        -webkit-user-select: none;
+        user-select: none;
+      }
+      #app-splash .splash-title {
+        font-size: 15px;
+        font-weight: 600;
+        letter-spacing: 0.08em;
+        color: #e7e4df;
+      }
+      #app-splash .splash-bar {
+        position: relative;
+        width: 132px;
+        height: 3px;
+        border-radius: 999px;
+        background: #262626;
+        overflow: hidden;
+      }
+      #app-splash .splash-bar::after {
+        content: '';
+        position: absolute;
+        inset: 0 auto 0 0;
+        width: 40%;
+        border-radius: 999px;
+        background: #89b4fa;
+        animation: splash-slide 1.1s ease-in-out infinite;
+      }
+      @keyframes splash-slide {
+        0% {
+          transform: translateX(-100%);
+        }
+        100% {
+          transform: translateX(250%);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root">
+      <!-- React 首次渲染会替换掉这段启动占位 -->
+      <div id="app-splash">
+        <div class="splash-title">YU CODE</div>
+        <div class="splash-bar"></div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

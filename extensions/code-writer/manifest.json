@@ -1,0 +1,17 @@
+{
+  "id": "code-writer",
+  "name": "写代码",
+  "description": "AI 辅助编码，支持多语言代码生成、重构和调试",
+  "version": "1.0.0",
+  "author": "PI Agent",
+  "entry": "index.ts",
+  "capabilities": ["chat", "file-read", "file-write", "terminal-exec", "code-analysis"],
+  "triggers": ["代码", "code", "函数", "实现", "写", "修复", "bug", "重构"],
+  "config": {
+    "defaultLanguage": "typescript",
+    "supportedLanguages": ["typescript", "javascript", "python", "rust", "go", "java", "c++"],
+    "maxFileSize": 100000,
+    "autoFormat": true,
+    "lintOnSave": true
+  }
+}

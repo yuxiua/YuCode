@@ -1,0 +1,16 @@
+{
+  "id": "script-creator",
+  "name": "剧本创建",
+  "description": "AI 驱动的剧本/场景创作工具，支持多类型、多风格创作",
+  "version": "1.0.0",
+  "author": "PI Agent",
+  "entry": "index.ts",
+  "capabilities": ["chat", "file-write"],
+  "triggers": ["剧本", "场景", "故事", "screenplay", "script", "场景描写"],
+  "config": {
+    "defaultStyle": "cinematic",
+    "supportedGenres": ["drama", "comedy", "thriller", "sci-fi", "romance", "horror"],
+    "outputFormat": "standard",
+    "maxScenes": 20
+  }
+}
