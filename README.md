@@ -34,14 +34,39 @@ Pi Agent 的能力足够强，但它只有 CLI 一种形态。对命令行熟练
 
 ## 截图
 
-| | |
-| :--: | :--: |
-| ![整体界面](info/开源素材/软件整体展示.png)<br>整体界面 | ![实际使用](info/开源素材/实际使用过程.png)<br>实际使用 |
-| ![对话](info/开源素材/对话框.png)<br>对话框 | ![执行流程](info/开源素材/执行流程.png)<br>执行流程 |
-| ![上下文自动压缩](info/开源素材/上下文自动压缩.png)<br>上下文自动压缩 | ![压缩后](info/开源素材/上下压缩（压后）.png)<br>压缩之后 |
-| ![代码高亮](info/开源素材/代码高亮，带ide.png)<br>代码高亮，带 IDE 能力 | ![终端](info/开源素材/终端.png)<br>内置终端 |
-| ![模型添加](info/开源素材/模型添加.png)<br>添加模型 | ![扩展](info/开源素材/扩展.png)<br>扩展 |
-| ![技能](info/开源素材/技能.png)<br>技能 | ![环境](info/开源素材/环境.png)<br>环境 |
+所有截图统一按 430px 宽排版（首图 880px），保证视觉节奏一致。
+
+<table>
+  <tr>
+    <td colspan="2" align="center">
+      <img src="info/开源素材/软件整体展示.png" width="880" alt="整体界面"><br>
+      <sub>整体界面</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center"><img src="info/开源素材/实际使用过程.png" width="430" alt="实际使用"><br><sub>实际使用</sub></td>
+    <td align="center"><img src="info/开源素材/对话框.png" width="430" alt="对话框"><br><sub>对话框</sub></td>
+  </tr>
+  <tr>
+    <td align="center"><img src="info/开源素材/上下文自动压缩.png" width="430" alt="上下文自动压缩"><br><sub>上下文自动压缩</sub></td>
+    <td align="center"><img src="info/开源素材/上下压缩（压后）.png" width="430" alt="压缩之后"><br><sub>压缩之后</sub></td>
+  </tr>
+  <tr>
+    <td align="center"><img src="info/开源素材/代码高亮，带ide.png" width="430" alt="代码高亮"><br><sub>代码高亮，带 IDE 能力</sub></td>
+    <td align="center"><img src="info/开源素材/执行流程.png" width="430" alt="执行流程"><br><sub>执行流程</sub></td>
+  </tr>
+  <tr>
+    <td align="center"><img src="info/开源素材/模型添加.png" width="430" alt="添加模型"><br><sub>添加模型</sub></td>
+    <td align="center"><img src="info/开源素材/扩展.png" width="430" alt="扩展"><br><sub>扩展</sub></td>
+  </tr>
+  <tr>
+    <td align="center"><img src="info/开源素材/技能.png" width="430" alt="技能"><br><sub>技能</sub></td>
+    <td align="center"><img src="info/开源素材/环境.png" width="430" alt="环境"><br><sub>环境</sub></td>
+  </tr>
+  <tr>
+    <td colspan="2" align="center"><img src="info/开源素材/终端.png" width="430" alt="内置终端"><br><sub>内置终端</sub></td>
+  </tr>
+</table>
 
 ## 下载与安装
 
