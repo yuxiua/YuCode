@@ -1,1 +1,4 @@
 powershell -NoProfile -ExecutionPolicy Bypass -File .\uninstall-yu-code.ps1
+
+发包
+POST https://uploads.github.com/repos/{owner}/{repo}/releases/{id}/assets?name=...

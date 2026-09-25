@@ -185,6 +185,17 @@ export interface Model {
   maxOutputTokens: number
   /** 是否支持多模态 */
   supportsMultimodal: boolean
+  /**
+   * 关闭该模型的思考（推理）输出。
+   * 部分网关（llama.cpp / vLLM 上的 Qwen 等）默认必定返回 reasoning_content，
+   * 思考会挤占输出预算并拖慢整轮，勾上后登记给 Pi 时带上关闭参数。
+   */
+  disableThinking?: boolean
+  /**
+   * 关闭思考时用哪种控制方式（各家网关的写法互不相通）。
+   * 只在 disableThinking 为真时有意义；不勾关闭思考时这一项不生效。
+   */
+  thinkingControl?: ThinkingControl
 }
 
 /** 模型自测的入参：只带登记与连通需要的字段 */
@@ -196,7 +207,18 @@ export interface ModelTestConfig {
   baseUrl: string
   contextWindow?: number
   maxOutputTokens?: number
+  /** 与 Model.disableThinking 同义，自测时按同样的规则登记 */
+  disableThinking?: boolean
+  /** 与 Model.thinkingControl 同义 */
+  thinkingControl?: ThinkingControl
 }
+
+/**
+ * 「关闭思考」的控制方式，对应主进程 pi-agent-model.js 的 THINKING_CONTROL：
+ * qwen = chat_template_kwargs（vLLM / llama.cpp），openai = reasoning_effort，
+ * deepseek = 顶层 thinking，none = 只声明能力、不额外发关闭参数。
+ */
+export type ThinkingControl = 'qwen' | 'openai' | 'deepseek' | 'none'
 
 /** 模型自测结果：三步依次是「登记到 Pi」「端点连通」「Pi 可识别」 */
 export interface ModelTestReport {

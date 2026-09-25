@@ -34,6 +34,8 @@ const EXT_ZIP = path.join(VENDOR_DIR, 'pi-extensions.zip')
 
 // 内置扩展。改这里就要同步改 electron/extensions-catalog.js（版本与描述在那边）。
 // 末尾的 pi-tui 是扩展的 peer 依赖：平时由 pi install 放进包目录，随包分发时得自己带上。
+// （另一个 peer 依赖 pi-ai 不在这儿 —— 它本来就在 vendor/pi 的依赖里，运行时用联接指过去，
+//   见 electron/pi-bundled-extensions.js 的 ensurePiAi，别重复装一份。）
 const EXT_PACKAGES = [
   'pi-subagents@0.71.0',
   'pi-hermes-memory@0.9.9',

@@ -111,6 +111,11 @@ export default function RightPanel() {
   const [liveContent, setLiveContent] = useState('')
   const [attachments, setAttachments] = useState<{ name: string; type: string }[]>([])
   const bottomRef = useRef<HTMLDivElement>(null)
+  // 过程窗滚动容器：用来判断用户是否已经上拉离开底部
+  const scrollRef = useRef<HTMLDivElement>(null)
+  // 只有视图停留在底部时才自动跟随最新过程；用户上拉后暂停，避免过程不断刷新把历史顶走
+  const autoFollowRef = useRef(true)
+  const lastScrollTopRef = useRef(0)
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const abortRef = useRef<AbortController | null>(null)
   const modelSelectRef = useRef<HTMLDivElement>(null)
@@ -178,7 +183,26 @@ export default function RightPanel() {
     autoResize()
   }, [input, autoResize])
 
+  // 上拉（scrollTop 变小）就停掉自动跟随；重新滚回底部再恢复。
+  // 只认「向上」这一个方向，程序化滚到底部时 scrollTop 只会变大，不会误判。
+  const handleScroll = useCallback(() => {
+    const el = scrollRef.current
+    if (!el) return
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40
+    const scrolledUp = el.scrollTop < lastScrollTopRef.current - 2
+    lastScrollTopRef.current = el.scrollTop
+    if (atBottom) autoFollowRef.current = true
+    else if (scrolledUp) autoFollowRef.current = false
+  }, [])
+
+  // 切换会话时回到最新位置
   useEffect(() => {
+    autoFollowRef.current = true
+    lastScrollTopRef.current = 0
+  }, [activeTabId])
+
+  useEffect(() => {
+    if (!autoFollowRef.current) return
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [activeTab.messages, agentStatus, processEvents, liveContent])
 
@@ -217,7 +241,7 @@ export default function RightPanel() {
     ? [
       activeModel.provider, activeModel.name, activeModel.apiKey || '', activeModel.baseUrl || '',
       activeModel.contextWindow, activeModel.maxInputTokens, activeModel.maxOutputTokens,
-      activeModel.supportsMultimodal,
+      activeModel.supportsMultimodal, activeModel.disableThinking, activeModel.thinkingControl,
     ].join('\u0000')
     : ''
 
@@ -232,6 +256,8 @@ export default function RightPanel() {
       maxInputTokens: activeModel.maxInputTokens,
       maxOutputTokens: activeModel.maxOutputTokens,
       supportsMultimodal: activeModel.supportsMultimodal,
+      disableThinking: activeModel.disableThinking,
+      thinkingControl: activeModel.thinkingControl,
     })
   }, [modelSignature]) // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -427,6 +453,8 @@ export default function RightPanel() {
     }
 
     setRunning(true)
+    // 自己发了新任务：无论之前停在哪段历史，都回到最新
+    autoFollowRef.current = true
     setTokenUsage({ inputTokens: 0, outputTokens: 0, tokensPerSecond: 0, live: false })
     taskStartRef.current = Date.now()
     setLiveContent('')
@@ -765,7 +793,7 @@ export default function RightPanel() {
       </div>
 
       {/* Messages */}
-      <div className="flex-1 overflow-y-auto px-3 py-3">
+      <div ref={scrollRef} onScroll={handleScroll} className="flex-1 overflow-y-auto px-3 py-3">
         {activeTab.messages.length === 0 ? (
           <div className="h-full flex flex-col items-center justify-center text-center">
             <div className="w-12 h-12 rounded-xl bg-pi-accent/10 flex items-center justify-center mb-3">

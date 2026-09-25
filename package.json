@@ -1,6 +1,6 @@
 {
   "name": "yu-code",
-  "version": "1.0.16",
+  "version": "1.0.18",
   "description": "Yu Code - AI-powered development environment",
   "main": "electron/main.js",
   "scripts": {

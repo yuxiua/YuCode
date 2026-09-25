@@ -35,6 +35,53 @@ const PROVIDER_STRING_FIELDS = ['name', 'baseUrl', 'api', 'apiKey']
 /** 校验要求非空字符串的 model 级字段 */
 const MODEL_STRING_FIELDS = ['id', 'name', 'api', 'baseUrl']
 
+/** pi 的思考档位，thinkingLevelMap 里能出现的全部键 */
+const THINKING_LEVEL_KEYS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
+
+/** 所有档位都标成「不支持」：pi 没有可选档位，就会固定在 off */
+function allLevelsUnsupported() {
+  return Object.fromEntries(THINKING_LEVEL_KEYS.map((key) => [key, null]))
+}
+
+/**
+ * 「关闭思考」的几种控制方式。
+ *
+ * 前提：pi 只在 model.reasoning 为 true 时才考虑思考参数 —— openai-completions 里每个
+ * thinkingFormat 分支都带着这个门槛。不声明 reasoning 它就是一个参数都不发，等于把开不开
+ * 完全交给网关（llama.cpp / vLLM 上的 Qwen 默认必开），这才是「关了没反应」的根因。
+ *
+ * 但「怎么关」各家写法互不相通，所以由用户在界面上选：
+ *  - qwen：vLLM / llama.cpp / SGLang 认 chat_template_kwargs。pi 走这个格式时压根不看
+ *          thinkingLevelMap，每轮无条件发 { enable_thinking: false }，档位全标不支持即可。
+ *  - openai：OpenAI 官方与多数兼容网关认 reasoning_effort。pi 只在「档位是 off 且
+ *          thinkingLevelMap.off 是字符串」时才发它，所以 off 要映射成 'none'
+ *          （实测 'off' / 'minimal' 会让该网关直接 500）。
+ *  - deepseek：DeepSeek 认顶层 thinking。pi 的判断条件是 thinkingLevelMap.off !== null，
+ *          给个非 null 值就会发 { type: 'disabled' }。
+ *  - none：只声明模型有思考能力，不额外发关闭参数，剩下交给 pi 的默认行为。
+ *
+ * 除 off 外全部标 null 是必须的：pi 对「缺失的档位」会套用 provider 默认值，
+ * 只要还留着一个可用档位，它就会默认选中那一档，思考照开。
+ */
+const THINKING_CONTROL = {
+  qwen: {
+    levels: allLevelsUnsupported(),
+    compat: { supportsDeveloperRole: false, supportsReasoningEffort: false, thinkingFormat: 'qwen-chat-template' },
+  },
+  openai: {
+    levels: { ...allLevelsUnsupported(), off: 'none' },
+    compat: { supportsReasoningEffort: true },
+  },
+  deepseek: {
+    levels: { ...allLevelsUnsupported(), off: 'disabled' },
+    compat: { supportsReasoningEffort: false, thinkingFormat: 'deepseek' },
+  },
+  none: {
+    levels: allLevelsUnsupported(),
+    compat: null,
+  },
+}
+
 function firstString(...values) {
   for (const v of values) if (typeof v === 'string' && v.trim()) return v.trim()
   return ''
@@ -123,16 +170,27 @@ function registerModel(config) {
   const doc = readModelsDoc()
   const providers = { ...(doc.providers || {}) }
 
+  const api = config.provider === 'anthropic' ? 'anthropic-messages' : 'openai-completions'
+  const model = {
+    id: modelId,
+    name: firstString(config.displayName, modelId),
+    contextWindow: Number(config.contextWindow) || 128000,
+    maxTokens: Number(config.maxOutputTokens) || 8192,
+  }
+  if (config.disableThinking) {
+    // pi 只在 model.reasoning 为 true 时才会考虑思考参数，这是所有控制方式的前提
+    model.reasoning = true
+    const control = THINKING_CONTROL[config.thinkingControl] || THINKING_CONTROL.qwen
+    model.thinkingLevelMap = control.levels
+    // compat 是 openai-completions 专属的字段，anthropic 那边写了反而多余
+    if (api === 'openai-completions' && control.compat) model.compat = control.compat
+  }
+
   providers[provider] = {
-    api: config.provider === 'anthropic' ? 'anthropic-messages' : 'openai-completions',
+    api,
     baseUrl,
     apiKey: firstString(config.apiKey) || PLACEHOLDER_API_KEY,
-    models: [{
-      id: modelId,
-      name: firstString(config.displayName, modelId),
-      contextWindow: Number(config.contextWindow) || 128000,
-      maxTokens: Number(config.maxOutputTokens) || 8192,
-    }],
+    models: [model],
   }
 
   // 顺手把文件里其它 provider 上的脏字段也修掉：留着它们会连累我们刚写进去的这条

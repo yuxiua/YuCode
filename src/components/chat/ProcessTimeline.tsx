@@ -270,7 +270,8 @@ export function ProcessSection({ events, durationMs }: {
   const thinkingCount = nodes.filter((n) => n.type === 'thinking').length
 
   return (
-    <div className="mb-3 w-full">
+    // select-text：界面默认禁选，过程信息（思考、工具输出、扩展通知、diff）要能选中复制
+    <div className="mb-3 w-full select-text">
       {/* 任务耗时 header */}
       <button
         onClick={() => setExpanded(!expanded)}
@@ -321,7 +322,8 @@ export function RunningProcess({ status, events, liveContent }: {
   }, [])
 
   return (
-    <div className="flex justify-start">
+    // select-text：与完成态一致，运行中的过程信息也能选中复制
+    <div className="flex justify-start select-text">
       <div className="bg-pi-surface border border-pi-border rounded-2xl rounded-bl-md w-full overflow-hidden">
         <button
           onClick={() => setExpanded(!expanded)}

@@ -15,3 +15,5 @@ info/*token*
 password
 # 本地发布助手，自己用，不入库
 scripts/publish-release.ps1
+# 本地源码打包脚本，自己用，不入库
+package-src.bat

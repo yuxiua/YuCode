@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { useAppStore, UI_FONT_OPTIONS } from '../../stores/appStore'
 import ToggleSwitch from '../common/ToggleSwitch'
 import McpSection from './McpSection'
-import type { Model, ModelTestConfig, ModelTestReport, ExtensionCatalogItem, InstalledExtension, PiRuntimeInfo } from '../../types'
+import type { Model, ModelTestConfig, ModelTestReport, ThinkingControl, ExtensionCatalogItem, InstalledExtension, PiRuntimeInfo } from '../../types'
 
 type Tab = 'general' | 'model' | 'extension' | 'skill' | 'terminal' | 'env'
 
@@ -12,6 +12,14 @@ const providerPresets: Record<string, { label: string; baseUrl: string }> = {
   deepseek: { label: 'DeepSeek', baseUrl: 'https://api.deepseek.com/v1' },
   custom: { label: '自定义', baseUrl: '' },
 }
+
+/** 关闭思考的控制方式：各家网关关思考的写法互不相通，只能按后端选 */
+const thinkingControlOptions: { value: ThinkingControl; label: string }[] = [
+  { value: 'qwen', label: 'Qwen / vLLM / llama.cpp' },
+  { value: 'openai', label: 'OpenAI（reasoning_effort）' },
+  { value: 'deepseek', label: 'DeepSeek' },
+  { value: 'none', label: '不额外控制' },
+]
 
 export default function SettingsPanel() {
   const { setSettingsOpen } = useAppStore()
@@ -166,6 +174,8 @@ function ModelSection() {
   const [maxInput, setMaxInput] = useState('199000')
   const [maxOutput, setMaxOutput] = useState('8192')
   const [multimodal, setMultimodal] = useState(false)
+  const [disableThinking, setDisableThinking] = useState(false)
+  const [thinkingControl, setThinkingControl] = useState<ThinkingControl>('qwen')
   // 自测：一次只测一个（表单或某个已保存的模型），结果贴在对应的位置下面
   const [testingId, setTestingId] = useState<string | null>(null)
   const [testReport, setTestReport] = useState<ModelTestReport | null>(null)
@@ -192,6 +202,8 @@ function ModelSection() {
     baseUrl: baseUrl.trim(),
     contextWindow: Number(contextWindow) || 0,
     maxOutputTokens: Number(maxOutput) || 0,
+    disableThinking,
+    thinkingControl,
   })
 
   const renderReport = (id: string) => {
@@ -229,6 +241,8 @@ function ModelSection() {
       maxInputTokens: Number(maxInput) || 0,
       maxOutputTokens: Number(maxOutput) || 0,
       supportsMultimodal: multimodal,
+      disableThinking,
+      thinkingControl,
     })
     resetForm()
   }
@@ -244,6 +258,8 @@ function ModelSection() {
     setMaxInput(String(m.maxInputTokens))
     setMaxOutput(String(m.maxOutputTokens))
     setMultimodal(m.supportsMultimodal)
+    setDisableThinking(!!m.disableThinking)
+    setThinkingControl(m.thinkingControl || 'qwen')
   }
 
   const handleSaveEdit = () => {
@@ -258,6 +274,8 @@ function ModelSection() {
       maxInputTokens: Number(maxInput) || 0,
       maxOutputTokens: Number(maxOutput) || 0,
       supportsMultimodal: multimodal,
+      disableThinking,
+      thinkingControl,
     })
     resetForm()
   }
@@ -266,7 +284,7 @@ function ModelSection() {
     setShowAdd(false)
     setEditingId(null)
     setDisplayName(''); setModelName(''); setApiKey(''); setBaseUrl('')
-    setProvider('openai'); setContextWindow('200000'); setMaxInput('199000'); setMaxOutput('8192'); setMultimodal(false)
+    setProvider('openai'); setContextWindow('200000'); setMaxInput('199000'); setMaxOutput('8192'); setMultimodal(false); setDisableThinking(false); setThinkingControl('qwen')
   }
 
   const isEditing = editingId !== null
@@ -368,6 +386,29 @@ function ModelSection() {
               </div>
               <ToggleSwitch checked={multimodal} onChange={() => setMultimodal(!multimodal)} />
             </div>
+            <div className="flex items-center justify-between mt-2.5 pt-2 border-t border-pi-border/50">
+              <div className="flex items-center gap-2">
+                <span className="text-[11px] text-pi-text">关闭思考</span>
+                <span className="text-[9px] px-1.5 py-0.5 rounded bg-pi-surface text-pi-text-dim border border-pi-border">
+                  {disableThinking ? '不返回推理内容' : '模型默认'}
+                </span>
+              </div>
+              <ToggleSwitch checked={disableThinking} onChange={() => setDisableThinking(!disableThinking)} />
+            </div>
+            {disableThinking && (
+              <div className="mt-2.5 pt-2 border-t border-pi-border/50 flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <span className="text-[11px] text-pi-text">控制方式</span>
+                  <p className="text-[9px] text-pi-text-dim mt-0.5">按后端网关选，选错会因参数不被识别而报错</p>
+                </div>
+                <select value={thinkingControl} onChange={(e) => setThinkingControl(e.target.value as ThinkingControl)}
+                  className="shrink-0 bg-pi-bg border border-pi-border rounded-lg px-2 py-1 text-[11px] outline-none focus:border-pi-accent/50">
+                  {thinkingControlOptions.map((o) => (
+                    <option key={o.value} value={o.value}>{o.label}</option>
+                  ))}
+                </select>
+              </div>
+            )}
           </div>
 
           <div className="flex gap-2 pt-1">
@@ -431,6 +472,8 @@ function ModelSection() {
                     provider: m.provider, model: m.name, displayName: m.displayName,
                     apiKey: m.apiKey || '', baseUrl: m.baseUrl || '',
                     contextWindow: m.contextWindow, maxOutputTokens: m.maxOutputTokens,
+                    disableThinking: m.disableThinking,
+                    thinkingControl: m.thinkingControl,
                   })}
                   disabled={testingId !== null}
                   className="text-[11px] text-pi-text-dim hover:text-pi-accent transition-colors disabled:opacity-40"

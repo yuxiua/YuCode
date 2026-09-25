@@ -74,9 +74,9 @@ declare global {
 
       // Agent
       sendToAgent: (message: string) => Promise<void>
-      setAgentModel: (config: { provider: string; model: string; apiKey: string; baseUrl: string; contextWindow: number; maxInputTokens: number; maxOutputTokens: number; supportsMultimodal: boolean }) => Promise<void>
+      setAgentModel: (config: { provider: string; model: string; apiKey: string; baseUrl: string; contextWindow: number; maxInputTokens: number; maxOutputTokens: number; supportsMultimodal: boolean; disableThinking?: boolean; thinkingControl?: 'qwen' | 'openai' | 'deepseek' | 'none' }) => Promise<void>
       /** 模型自测：返回「登记到 Pi / 端点连通 / Pi 可识别」三步的逐步结果 */
-      testModel: (config: { provider: string; model: string; displayName?: string; apiKey?: string; baseUrl: string; contextWindow?: number; maxOutputTokens?: number }) => Promise<{
+      testModel: (config: { provider: string; model: string; displayName?: string; apiKey?: string; baseUrl: string; contextWindow?: number; maxOutputTokens?: number; disableThinking?: boolean; thinkingControl?: 'qwen' | 'openai' | 'deepseek' | 'none' }) => Promise<{
         ok: boolean
         steps: { name: string; ok: boolean; detail: string }[]
       }>
