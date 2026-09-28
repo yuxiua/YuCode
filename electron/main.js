@@ -17,14 +17,32 @@ const builtinsEngine = require('./builtins')
 const { McpManager } = require('./mcp')
 const lsp = require('./lsp')
 
-let mainWindow
-let agent
+// MCP 客户端全局共享：多个工作区共用一个连接池。
 let mcp
 
-// 右键"用 Yu Code 打开"在冷启动时传入的路径。
-// 渲染进程挂载完成前发的 IPC 会直接丢掉，所以先存下来，等渲染进程报到后再派发。
-let pendingOsOpen = null
-let rendererReady = false
+// ─── 多窗口 / 多工作区 ───────────────────────────────────────────────────────
+// 支持多开：每个窗口是一个独立的工作区；窗口内每个聊天会话（chatId）又各有一个
+// 独立的 Agent 实例，所以多个窗口、同一窗口里的多个会话都能并发干活、互不打扰。
+// 以 webContents.id 作为窗口上下文的键，所有原先的模块级单例都挪进 ctx。
+const windows = new Map()
+
+function ctxOf(event) {
+  return windows.get(event.sender.id)
+}
+
+/** 该 IPC 来自哪个窗口；极端情况下拿不到就退回第一个还活着的窗口 */
+function ctxWin(event) {
+  const ctx = ctxOf(event)
+  if (ctx && !ctx.win.isDestroyed()) return ctx.win
+  return BrowserWindow.fromWebContents(event.sender) || firstWindow()
+}
+
+function firstWindow() {
+  for (const ctx of windows.values()) {
+    if (!ctx.win.isDestroyed()) return ctx.win
+  }
+  return null
+}
 
 // 是否开发模式（--dev 或 NODE_ENV=development），模块级常量供多处使用
 const isDev = process.env.NODE_ENV === 'development' || process.argv.includes('--dev')
@@ -72,10 +90,13 @@ async function resolveDevUrl() {
   return DEFAULT_DEV_URL
 }
 
-function createWindow() {
-  // 新窗口的渲染进程还没挂载，等它发 app:renderer-ready 后再派发待打开的路径
-  rendererReady = false
-  mainWindow = new BrowserWindow({
+/**
+ * 建一个新窗口。targetDir 是这次要打开的工作区目录（为空表示沿用上次的目录）。
+ * 支持多开：菜单「打开文件夹」、右键目录打开、启动参数都会走到这里。
+ */
+function createWindow(targetDir) {
+  const dir = isExistingDir(targetDir) ? path.resolve(targetDir) : ''
+  const win = new BrowserWindow({
     width: 1400,
     height: 900,
     minWidth: 1024,
@@ -100,45 +121,112 @@ function createWindow() {
     },
   })
 
+  const wcId = win.webContents.id
+  const ctx = {
+    win,
+    /** chatId → Agent 实例 */
+    agents: new Map(),
+    /** 该窗口的工作目录（安全边界 + 文件监听 + 检查点都以它为准） */
+    allowedDir: dir || null,
+    watcher: null,
+    watchTimer: null,
+    /** Agent 操控的浏览器窗口 */
+    browserWindow: null,
+    /** 该窗口创建的终端 id，窗口关闭时一并收掉 */
+    terminalIds: new Set(),
+    /** 待打开的路径（右键传入的文件，渲染进程没挂载前先存着） */
+    pendingOpen: targetDir && !dir ? targetDir : null,
+    rendererReady: false,
+    /** 该窗口的 Agent 参数（模型、目录、计划模式、扩展…），新会话创建时套用 */
+    settings: {
+      model: null,
+      projectDir: dir || '',
+      planMode: false,
+      extensions: [],
+      riskConfirm: true,
+      autoDiagnostics: true,
+    },
+  }
+  windows.set(wcId, ctx)
+
   // 渲染进程崩溃/加载失败时把原因输出到终端，便于排查白屏
-  mainWindow.webContents.on('render-process-gone', (_e, details) => {
+  win.webContents.on('render-process-gone', (_e, details) => {
     console.error('[renderer] process gone:', details)
   })
-  mainWindow.webContents.on('did-fail-load', (_e, code, desc, url) => {
+  win.webContents.on('did-fail-load', (_e, code, desc, url) => {
     console.error(`[renderer] did-fail-load ${code} ${desc} ${url}`)
   })
-  mainWindow.webContents.on('preload-error', (_e, preloadPath, error) => {
+  win.webContents.on('preload-error', (_e, preloadPath, error) => {
     console.error('[renderer] preload error:', preloadPath, error)
   })
 
   if (isDev) {
     // 开发模式下把渲染进程的控制台输出转发到终端，便于排查
-    mainWindow.webContents.on('console-message', (_e, level, message, line, sourceId) => {
+    win.webContents.on('console-message', (_e, level, message, line, sourceId) => {
       console.log(`[renderer:${level}] ${message} @ ${sourceId}:${line}`)
     })
     // 仅在显式设置 DEBUG_DEVTOOLS=1 时才弹出开发者工具，避免默认遮挡主窗口
     if (process.env.DEBUG_DEVTOOLS === '1') {
-      mainWindow.webContents.openDevTools({ mode: 'detach' })
+      win.webContents.openDevTools({ mode: 'detach' })
     }
     resolveDevUrl().then((url) => {
       console.log(`[dev] loading ${url}`)
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.loadURL(url)
-      }
+      if (!win.isDestroyed()) win.loadURL(url)
     })
   } else {
-    mainWindow.loadFile(path.join(__dirname, '../dist/index.html'))
+    win.loadFile(path.join(__dirname, '../dist/index.html'))
   }
 
-  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+  win.webContents.setWindowOpenHandler(({ url }) => {
     shell.openExternal(url)
     return { action: 'deny' }
   })
+
+  // 窗口关闭：把它名下的 Agent、文件监听、终端、浏览器窗口都收干净，
+  // 否则关掉工作区后后台还留着 pi 子进程和文件句柄。
+  win.on('closed', () => {
+    for (const id of ctx.terminalIds) killTerminal(id)
+    ctx.terminalIds.clear()
+    stopCtxWatch(ctx)
+    for (const a of ctx.agents.values()) {
+      try { a.shutdown?.() } catch { /* ignore */ }
+    }
+    ctx.agents.clear()
+    if (ctx.browserWindow && !ctx.browserWindow.isDestroyed()) ctx.browserWindow.close()
+    ctx.browserWindow = null
+    windows.delete(wcId)
+  })
+
+  // 新窗口立刻按目标目录建立文件监听，右键去重也能马上认出来
+  if (dir) startCtxWatch(ctx, dir)
+  return ctx
 }
 
 // Terminal management
 const terminals = new Map()
 let terminalCounter = 0
+
+/** 窗口可能已经关了，别往销毁的 webContents 上发（会抛异常） */
+function safeSend(wc, channel, ...args) {
+  if (wc && !wc.isDestroyed()) wc.send(channel, ...args)
+}
+
+function killTerminal(id) {
+  const proc = terminals.get(id)
+  if (!proc) return
+  terminals.delete(id)
+  const pid = proc.pid
+  try { proc.kill() } catch { /* 已退出 */ }
+  // Windows 上 pty.kill() 走的是异步清理（fork 一个 agent 进程查控制台进程列表，再逐个 process.kill），
+  // 应用退出时事件循环马上停摆，这段逻辑来不及跑完，powershell/conhost 就会残留成孤儿，
+  // 进而把主进程卡在原生收尾阶段——表现就是关掉窗口后任务管理器里还挂着 Yu Code.exe 和 powershell.exe。
+  // 这里直接 taskkill /F /T 强杀整棵终端进程树兜底（复用 agent-tools/jsonrpc 的既有做法）。
+  if (process.platform === 'win32' && pid) {
+    try {
+      spawn('taskkill', ['/F', '/T', '/PID', String(pid)], { windowsHide: true })
+    } catch { /* ignore */ }
+  }
+}
 
 // 真实 PTY（node-pty）。拿不到就退回到管道模式，保证终端仍可用、且不会拖垮应用启动。
 let pty = null
@@ -200,6 +288,9 @@ function resolveTerminalCwd(cwd) {
 
 ipcMain.handle('terminal:create', (event, { cwd, shell, pythonEnv, cols, rows }) => {
   const id = `term-${++terminalCounter}`
+  // 记下这个终端属于哪个窗口，窗口关闭时一并收掉
+  const ctx = ctxOf(event)
+  if (ctx) ctx.terminalIds.add(id)
   const isWin = process.platform === 'win32'
 
   let shellPath, args
@@ -262,10 +353,10 @@ ipcMain.handle('terminal:create', (event, { cwd, shell, pythonEnv, cols, rows })
         useConpty: true,
       })
       p.onData((data) => {
-        event.sender.send(`terminal:data:${id}`, data)
+        safeSend(event.sender, `terminal:data:${id}`, data)
       })
       p.onExit(({ exitCode }) => {
-        event.sender.send(`terminal:close:${id}`, exitCode)
+        safeSend(event.sender, `terminal:close:${id}`, exitCode)
         terminals.delete(id)
       })
       terminals.set(id, p)
@@ -285,20 +376,20 @@ ipcMain.handle('terminal:create', (event, { cwd, shell, pythonEnv, cols, rows })
   terminals.set(id, proc)
 
   proc.stdout.on('data', (data) => {
-    event.sender.send(`terminal:data:${id}`, data)
+    safeSend(event.sender, `terminal:data:${id}`, data)
   })
   proc.stderr.on('data', (data) => {
-    event.sender.send(`terminal:data:${id}`, data)
+    safeSend(event.sender, `terminal:data:${id}`, data)
   })
   // 启动失败（shell 找不到、cwd 无效等）会走 error 事件而不是 close：
   // 不接住它就是主进程未捕获异常，整个应用弹「A JavaScript error occurred in the main process」。
   proc.on('error', (e) => {
     console.error(`[terminal] 启动失败: ${e.message}`)
     terminals.delete(id)
-    event.sender.send(`terminal:close:${id}`, -1)
+    safeSend(event.sender, `terminal:close:${id}`, -1)
   })
   proc.on('close', (code) => {
-    event.sender.send(`terminal:close:${id}`, code)
+    safeSend(event.sender, `terminal:close:${id}`, code)
     terminals.delete(id)
   })
 
@@ -320,11 +411,7 @@ ipcMain.on('terminal:resize', (event, { id, cols, rows }) => {
 })
 
 ipcMain.handle('terminal:kill', (event, { id }) => {
-  const proc = terminals.get(id)
-  if (proc) {
-    proc.kill()
-    terminals.delete(id)
-  }
+  killTerminal(id)
 })
 
 // 终端里是否还有命令在跑：查 shell 进程的子进程。
@@ -368,7 +455,7 @@ ipcMain.handle('terminal:has-children', (event, { id }) => {
 
 // Native dialog - open folder
 ipcMain.handle('dialog:open-folder', async (event) => {
-  const result = await dialog.showOpenDialog(mainWindow, {
+  const result = await dialog.showOpenDialog(ctxWin(event), {
     properties: ['openDirectory'],
     title: '选择文件夹',
   })
@@ -378,7 +465,7 @@ ipcMain.handle('dialog:open-folder', async (event) => {
 
 // Native dialog - open file
 ipcMain.handle('dialog:open-file', async (event) => {
-  const result = await dialog.showOpenDialog(mainWindow, {
+  const result = await dialog.showOpenDialog(ctxWin(event), {
     properties: ['openFile'],
     title: '选择文件',
   })
@@ -388,27 +475,27 @@ ipcMain.handle('dialog:open-file', async (event) => {
 
 // Create new file (save dialog)
 ipcMain.handle('file:create', async (event) => {
-  const result = await dialog.showSaveDialog(mainWindow, {
+  const result = await dialog.showSaveDialog(ctxWin(event), {
     title: '新建文件',
     defaultPath: path.join(process.cwd(), 'untitled.txt'),
   })
   if (result.canceled || !result.filePath) return null
   const fs = require('fs/promises')
   await fs.writeFile(result.filePath, '', 'utf-8')
-  event.sender.send('file:created', { filePath: result.filePath })
+  safeSend(event.sender, 'file:created', { filePath: result.filePath })
   return result.filePath
 })
 
-// Open folder and notify renderer
-ipcMain.handle('folder:open-and-set', async (event) => {
-  const result = await dialog.showOpenDialog(mainWindow, {
+// 菜单「打开文件夹」：弹出选择框，选中的目录在新窗口里打开，当前窗口保持不变。
+// 若该目录已经打开，则聚焦那个窗口、不再新起（与右键目录打开一致）。
+ipcMain.handle('window:open-folder', async (event) => {
+  const parent = ctxWin(event)
+  const result = await dialog.showOpenDialog(parent, {
     properties: ['openDirectory'],
     title: '打开文件夹',
   })
   if (result.canceled || result.filePaths.length === 0) return null
-  const dirPath = result.filePaths[0]
-  event.sender.send('folder:opened', { dirPath })
-  return dirPath
+  return openTarget(result.filePaths[0])
 })
 
 // Python environment detection
@@ -493,17 +580,20 @@ ipcMain.handle('python:inspect-env', async (event, { dirPath }) => {
 })
 
 // ─── Agent Security Layer ────────────────────────────────────────────────────
-// 限制 agent 只能访问已打开的项目目录及其子目录
-let allowedDir = null
-
+// 限制 agent 只能访问已打开的项目目录及其子目录（每个窗口一个边界，互不影响）
 ipcMain.on('security:set-allowed-dir', (event, { dirPath }) => {
-  allowedDir = path.resolve(dirPath)
-  console.log(`[Security] Allowed directory set to: ${allowedDir}`)
+  const ctx = ctxOf(event)
+  if (!ctx) return
+  const dir = dirPath ? path.resolve(dirPath) : null
+  ctx.allowedDir = dir
+  console.log(`[Security] Allowed directory set to: ${dir}`)
   // 工作目录变化时同步切换文件监听
-  startDirWatch(allowedDir)
+  if (dir) startCtxWatch(ctx, dir)
+  // MCP 是全局共享的：工作目录跟随最后一次设置的窗口（多工作区下只能取近似值）
+  if (dir) mcp?.setProjectDir?.(dir)
 })
 
-function isPathAllowed(targetPath) {
+function isPathAllowed(allowedDir, targetPath) {
   if (!allowedDir) return true // 未设置时不限制（兼容手动操作）
   const resolved = path.resolve(targetPath)
   return resolved.startsWith(allowedDir + path.sep) || resolved === allowedDir
@@ -547,10 +637,11 @@ ipcMain.handle('fs:read', async (event, { filePath }) => {
 
 ipcMain.handle('fs:write', async (event, { filePath, content }) => {
   const fs = require('fs/promises')
+  const allowedDir = ctxOf(event)?.allowedDir
   if (isSensitivePath(filePath)) {
     throw new Error(`安全限制：禁止写入敏感文件 ${filePath}`)
   }
-  if (allowedDir && !isPathAllowed(filePath)) {
+  if (allowedDir && !isPathAllowed(allowedDir, filePath)) {
     throw new Error(`安全限制：路径超出工作目录范围 (${allowedDir})`)
   }
   await fs.mkdir(path.dirname(filePath), { recursive: true })
@@ -561,7 +652,8 @@ ipcMain.handle('fs:write', async (event, { filePath, content }) => {
 
 ipcMain.handle('fs:list', async (event, { dirPath }) => {
   const fs = require('fs/promises')
-  if (allowedDir && !isPathAllowed(dirPath)) {
+  const allowedDir = ctxOf(event)?.allowedDir
+  if (allowedDir && !isPathAllowed(allowedDir, dirPath)) {
     throw new Error(`安全限制：目录超出工作目录范围 (${allowedDir})`)
   }
   const entries = await fs.readdir(dirPath, { withFileTypes: true })
@@ -575,20 +667,21 @@ ipcMain.handle('fs:list', async (event, { dirPath }) => {
 // Create directory
 ipcMain.handle('fs:mkdir', async (event, { dirPath }) => {
   const fs = require('fs/promises')
-  if (allowedDir && !isPathAllowed(dirPath)) {
+  const allowedDir = ctxOf(event)?.allowedDir
+  if (allowedDir && !isPathAllowed(allowedDir, dirPath)) {
     throw new Error(`安全限制：路径超出工作目录范围 (${allowedDir})`)
   }
   await fs.mkdir(dirPath, { recursive: true })
 })
 
 // 把 src 复制进 targetDir，重名自动加「- 副本」序号，返回落地路径
-async function copyInto(srcPath, targetDir) {
+async function copyInto(srcPath, targetDir, allowedDir) {
   const fs = require('fs/promises')
   if (isSensitivePath(srcPath)) {
     throw new Error('安全限制：禁止复制敏感文件')
   }
   let dest = path.join(targetDir, path.basename(srcPath))
-  if (allowedDir && !isPathAllowed(dest)) {
+  if (allowedDir && !isPathAllowed(allowedDir, dest)) {
     throw new Error(`安全限制：路径超出工作目录范围 (${allowedDir})`)
   }
   // 目标已存在时自动加序号，避免覆盖
@@ -611,11 +704,11 @@ async function copyInto(srcPath, targetDir) {
 
 // Copy file/folder (recursive)
 ipcMain.handle('fs:copy', async (event, { sourcePath, targetDir }) => {
-  return copyInto(sourcePath, targetDir)
+  return copyInto(sourcePath, targetDir, ctxOf(event)?.allowedDir)
 })
 
 // 把 src 移动到 targetDir（剪切+粘贴），重名自动加「- 副本」序号，返回落地路径
-async function moveInto(srcPath, targetDir) {
+async function moveInto(srcPath, targetDir, allowedDir) {
   const fs = require('fs/promises')
   if (isSensitivePath(srcPath)) {
     throw new Error('安全限制：禁止移动敏感文件')
@@ -627,7 +720,7 @@ async function moveInto(srcPath, targetDir) {
     throw new Error('安全限制：不能把文件夹移动到它自己内部')
   }
   let dest = path.join(destDir, path.basename(src))
-  if (allowedDir && !isPathAllowed(dest)) {
+  if (allowedDir && !isPathAllowed(allowedDir, dest)) {
     throw new Error(`安全限制：路径超出工作目录范围 (${allowedDir})`)
   }
   // 源和目标就是同一个位置，什么都不用做
@@ -661,15 +754,16 @@ async function moveInto(srcPath, targetDir) {
 
 // Move file/folder into target directory
 ipcMain.handle('fs:move', async (event, { sourcePath, targetDir }) => {
-  return moveInto(sourcePath, targetDir)
+  return moveInto(sourcePath, targetDir, ctxOf(event)?.allowedDir)
 })
 
 // 从系统外部（拖拽 / 资源管理器复制）导入文件或文件夹到目标目录
 ipcMain.handle('fs:import-paths', async (event, { sourcePaths, targetDir }) => {
   const fs = require('fs/promises')
+  const allowedDir = ctxOf(event)?.allowedDir
   if (!Array.isArray(sourcePaths) || sourcePaths.length === 0) return []
   const destDir = path.resolve(targetDir)
-  if (allowedDir && !isPathAllowed(destDir)) {
+  if (allowedDir && !isPathAllowed(allowedDir, destDir)) {
     throw new Error(`安全限制：目录超出工作目录范围 (${allowedDir})`)
   }
   const imported = []
@@ -683,7 +777,7 @@ ipcMain.handle('fs:import-paths', async (event, { sourcePaths, targetDir }) => {
     } catch {
       continue // 源路径已不存在，跳过
     }
-    imported.push(await copyInto(resolvedSrc, destDir))
+    imported.push(await copyInto(resolvedSrc, destDir, allowedDir))
   }
   return imported
 })
@@ -790,48 +884,50 @@ ipcMain.handle('clipboard:write-files', async (event, { paths, cut }) => {
 })
 
 // ─── 目录变更监听 ────────────────────────────────────────────────────────────
-// 外部（资源管理器、其他软件、agent）改动文件后主动推给渲染进程，文件树无需手动刷新
-let dirWatcher = null
-let watchTimer = null
-
-function startDirWatch(dirPath) {
-  stopDirWatch()
-  if (!dirPath) return
+// 外部（资源管理器、其他软件、agent）改动文件后主动推给渲染进程，文件树无需手动刷新。
+// 每个窗口各自监听自己的工作目录：多开时互不影响。
+function startCtxWatch(ctx, dirPath) {
+  stopCtxWatch(ctx)
+  if (!dirPath || !ctx) return
   const fs = require('fs')
   try {
     // recursive 在 Windows/macOS 上原生支持，可覆盖整个子树
-    dirWatcher = fs.watch(dirPath, { recursive: true }, () => {
+    ctx.watcher = fs.watch(dirPath, { recursive: true }, () => {
       // 编辑器保存/批量复制会触发大量事件，做防抖避免渲染进程被打爆
-      if (watchTimer) clearTimeout(watchTimer)
-      watchTimer = setTimeout(() => {
-        watchTimer = null
-        if (mainWindow && !mainWindow.isDestroyed()) {
-          mainWindow.webContents.send('fs:dir-changed', { dirPath })
-        }
+      if (ctx.watchTimer) clearTimeout(ctx.watchTimer)
+      ctx.watchTimer = setTimeout(() => {
+        ctx.watchTimer = null
+        safeSend(ctx.win.webContents, 'fs:dir-changed', { dirPath })
       }, 300)
     })
-    dirWatcher.on('error', (e) => {
+    ctx.watcher.on('error', (e) => {
       console.error('[fs:watch] 监听失败:', e.message)
-      stopDirWatch()
+      stopCtxWatch(ctx)
     })
   } catch (e) {
     console.error('[fs:watch] 无法监听目录:', e.message)
   }
 }
 
-function stopDirWatch() {
-  if (watchTimer) {
-    clearTimeout(watchTimer)
-    watchTimer = null
+function stopCtxWatch(ctx) {
+  if (!ctx) return
+  if (ctx.watchTimer) {
+    clearTimeout(ctx.watchTimer)
+    ctx.watchTimer = null
   }
-  if (dirWatcher) {
-    try { dirWatcher.close() } catch { /* 忽略 */ }
-    dirWatcher = null
+  if (ctx.watcher) {
+    try { ctx.watcher.close() } catch { /* 忽略 */ }
+    ctx.watcher = null
   }
 }
 
+function stopAllWatches() {
+  for (const ctx of windows.values()) stopCtxWatch(ctx)
+}
+
 ipcMain.handle('fs:watch-dir', (event, { dirPath }) => {
-  startDirWatch(dirPath)
+  const ctx = ctxOf(event)
+  if (ctx) startCtxWatch(ctx, dirPath)
   return { success: true }
 })
 
@@ -844,10 +940,11 @@ ipcMain.handle('shell:show-item', (event, { targetPath }) => {
 // Delete file/folder
 ipcMain.handle('fs:delete', async (event, { targetPath }) => {
   const fs = require('fs/promises')
+  const allowedDir = ctxOf(event)?.allowedDir
   if (isSensitivePath(targetPath)) {
     throw new Error(`安全限制：禁止删除敏感文件`)
   }
-  if (allowedDir && !isPathAllowed(targetPath)) {
+  if (allowedDir && !isPathAllowed(allowedDir, targetPath)) {
     throw new Error(`安全限制：路径超出工作目录范围`)
   }
   await fs.rm(targetPath, { recursive: true })
@@ -856,108 +953,216 @@ ipcMain.handle('fs:delete', async (event, { targetPath }) => {
 // Rename file/folder
 ipcMain.handle('fs:rename', async (event, { oldPath, newPath }) => {
   const fs = require('fs/promises')
+  const allowedDir = ctxOf(event)?.allowedDir
   if (isSensitivePath(oldPath) || isSensitivePath(newPath)) {
     throw new Error(`安全限制：禁止重命名敏感文件`)
   }
-  if (allowedDir && (!isPathAllowed(oldPath) || !isPathAllowed(newPath))) {
+  if (allowedDir && (!isPathAllowed(allowedDir, oldPath) || !isPathAllowed(allowedDir, newPath))) {
     throw new Error(`安全限制：路径超出工作目录范围`)
   }
   await fs.rename(oldPath, newPath)
 })
 
 // ─── Browser Control (Agent) ─────────────────────────────────────────────────
-// Agent 可以通过内置 BrowserWindow 操控浏览器
-let browserWindow = null
-
+// Agent 可以通过内置 BrowserWindow 操控浏览器（每个窗口一个，互不干扰）
 ipcMain.handle('browser:open', async (event, { url, width, height }) => {
+  const ctx = ctxOf(event)
+  if (!ctx) return { id: 'browser-main', url }
   const { BrowserWindow: BW } = require('electron')
-  if (browserWindow && !browserWindow.isDestroyed()) {
-    browserWindow.loadURL(url)
-    browserWindow.focus()
+  if (ctx.browserWindow && !ctx.browserWindow.isDestroyed()) {
+    ctx.browserWindow.loadURL(url)
+    ctx.browserWindow.focus()
     return { id: 'browser-main', url }
   }
-  browserWindow = new BW({
+  ctx.browserWindow = new BW({
     width: width || 1200,
     height: height || 800,
-    parent: mainWindow,
+    parent: ctx.win,
     title: 'Yu Code Browser',
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
     },
   })
-  browserWindow.loadURL(url)
-  browserWindow.on('closed', () => { browserWindow = null })
+  ctx.browserWindow.loadURL(url)
+  ctx.browserWindow.on('closed', () => { ctx.browserWindow = null })
   return { id: 'browser-main', url }
 })
 
 ipcMain.handle('browser:navigate', async (event, { url }) => {
-  if (browserWindow && !browserWindow.isDestroyed()) {
-    await browserWindow.loadURL(url)
+  const bw = ctxOf(event)?.browserWindow
+  if (bw && !bw.isDestroyed()) {
+    await bw.loadURL(url)
     return { success: true }
   }
   return { success: false, error: 'No browser window open' }
 })
 
 ipcMain.handle('browser:execute', async (event, { script }) => {
-  if (browserWindow && !browserWindow.isDestroyed()) {
-    const result = await browserWindow.webContents.executeJavaScript(script)
+  const bw = ctxOf(event)?.browserWindow
+  if (bw && !bw.isDestroyed()) {
+    const result = await bw.webContents.executeJavaScript(script)
     return { success: true, result }
   }
   return { success: false, error: 'No browser window open' }
 })
 
 ipcMain.handle('browser:screenshot', async (event) => {
-  if (browserWindow && !browserWindow.isDestroyed()) {
-    const image = await browserWindow.webContents.capturePage()
+  const ctx = ctxOf(event)
+  const bw = ctx?.browserWindow
+  if (bw && !bw.isDestroyed()) {
+    const image = await bw.webContents.capturePage()
     const pngData = image.toPNG()
-    const savePath = path.join(allowedDir || process.cwd(), `screenshot-${Date.now()}.png`)
+    const savePath = path.join(ctx.allowedDir || process.cwd(), `screenshot-${Date.now()}.png`)
     require('fs').writeFileSync(savePath, pngData)
     return { success: true, path: savePath }
   }
   return { success: false, error: 'No browser window open' }
 })
 
-ipcMain.handle('browser:close', async () => {
-  if (browserWindow && !browserWindow.isDestroyed()) {
-    browserWindow.close()
-    browserWindow = null
+ipcMain.handle('browser:close', async (event) => {
+  const ctx = ctxOf(event)
+  const bw = ctx?.browserWindow
+  if (bw && !bw.isDestroyed()) {
+    bw.close()
+    if (ctx) ctx.browserWindow = null
   }
   return { success: true }
 })
 
-// Agent service
-ipcMain.handle('agent:send', (event, { message }) => {
-  if (agent) {
-    agent.handleMessage(message)
-    return { success: true }
+// ─── Agent 实例（每个窗口 × 每个会话一个）────────────────────────────────────
+// 事件要能区分来自哪个会话：用一层 shim 顶替 agent 的 mainWindow，
+// 发送时统一带上 __chatId，渲染进程据此把事件投递到对应会话的时间线。
+// 这样同一窗口里多个会话可以各跑各的、互不打扰。
+function agentShim(ctx, chatId) {
+  return {
+    isDestroyed: () => ctx.win.isDestroyed(),
+    webContents: {
+      send: (channel, payload) => {
+        if (ctx.win.isDestroyed()) return
+        ctx.win.webContents.send(channel, { __chatId: chatId, data: payload })
+      },
+    },
   }
-  return { success: false, error: 'Agent not initialized' }
+}
+
+// 默认用内置的 pi CLI 当引擎；自研引擎（YuCodeAgent）保留成回退路径。
+// 切换方式：环境变量 YUCODE_AGENT_BACKEND=native|pi，或状态文件里的 agentBackend。
+function pickBackend() {
+  const fromEnv = String(process.env.YUCODE_AGENT_BACKEND || '').trim().toLowerCase()
+  if (fromEnv === 'native' || fromEnv === 'pi') return fromEnv
+  const saved = stateStore.getAll()?.agentBackend
+  if (saved === 'native' || saved === 'pi') return saved
+  return 'pi'
+}
+
+function newAgentInstance(ctx, chatId) {
+  const wanted = pickBackend()
+  const usePi = wanted === 'pi' && piRuntime.getPiInfo().available
+  if (wanted === 'pi' && !usePi) {
+    console.warn('[agent] 没有找到 pi CLI，回退到自研引擎')
+  }
+  const shim = agentShim(ctx, chatId)
+  const projectDir = ctx.settings.projectDir || __dirname + '/..'
+  let a
+  if (usePi) {
+    // pi 的会话落盘在 userData 下，不和用户自己的 ~/.pi 混在一起
+    a = new PiAgent(shim, projectDir, {
+      sessionDir: path.join(app.getPath('userData'), 'pi-sessions'),
+    })
+  } else {
+    a = new YuCodeAgent(shim, projectDir)
+  }
+  if (mcp) a.setMcp?.(mcp)
+  return a
+}
+
+/** 把窗口的 Agent 参数套到某个实例上（新会话也要按当前设置初始化） */
+function applyAgentSettings(a, ctx) {
+  const s = ctx.settings
+  if (s.model) a.setModelConfig?.(s.model)
+  a.setExtensions?.(s.extensions || [])
+  a.setRiskConfirm?.(s.riskConfirm !== false)
+  a.setAutoDiagnostics?.(s.autoDiagnostics !== false)
+  // 计划模式默认关闭，只在开启时下发，避免新建会话时刷出「已关闭计划模式」的噪音
+  if (s.planMode) a.setPlanMode?.(true)
+}
+
+/** 取该窗口下某个会话的 Agent；没有就按当前设置建一个（惰性创建，支持并发会话） */
+function agentFor(ctx, chatId) {
+  const key = chatId || 'default'
+  let a = ctx.agents.get(key)
+  if (a) return a
+  a = newAgentInstance(ctx, key)
+  // Pi 后端按 chatId 区分会话；自研后端按 messages 整段替换上下文
+  a.loadContext?.({ chatId: key })
+  applyAgentSettings(a, ctx)
+  ctx.agents.set(key, a)
+  return a
+}
+
+function forEachAgent(ctx, fn) {
+  for (const a of ctx.agents.values()) {
+    try { fn(a) } catch { /* 单个会话出错不影响其它会话 */ }
+  }
+}
+
+// 发消息：必须带上 chatId，否则会把不同会话的内容串到一起
+ipcMain.handle('agent:send', (event, { message, chatId, model } = {}) => {
+  const ctx = ctxOf(event)
+  if (!ctx) return { success: false, error: 'Window not found' }
+  const a = agentFor(ctx, chatId)
+  // 模型随消息一起来：每个会话按自己绑定的模型跑。
+  // 放在 handleMessage 之前，pi 起会话时才能把 --model 带上。
+  if (model) a.setModelConfig?.(model)
+  a.handleMessage(message)
+  return { success: true }
 })
 
-ipcMain.handle('agent:set-model', (event, config) => {
-  if (agent) agent.setModelConfig(config)
+// 模型配置按会话下发：同一窗口里会话 1 用 A 模型、会话 2 用 B 模型都成立。
+// 不带 chatId 时才作为窗口默认，广播给该窗口所有会话。
+ipcMain.handle('agent:set-model', (event, payload) => {
+  const ctx = ctxOf(event)
+  if (!ctx) return
+  const config = payload?.config ?? payload
+  const chatId = payload?.chatId
+  if (!config) return
+  if (chatId) {
+    // 只改已经存在的会话实例。这里不能走 agentFor —— 那会顺手新建 Agent 并调
+    // loadContext，而自研引擎的 loadContext({}) 会把上下文清空，
+    // 于是「切到正在跑的会话」就会把它的历史冲掉。还没建实例的会话，
+    // 等它下次发消息时由 agent:send 带着模型一起建，不会漏。
+    ctx.agents.get(chatId)?.setModelConfig?.(config)
+    return
+  }
+  ctx.settings.model = config
+  forEachAgent(ctx, (a) => a.setModelConfig?.(config))
 })
 
 // 设置页的「测试」：登记到 pi → 直连端点 → 让 pi 认一遍。
 // 三步都在主进程做，渲染进程只负责显示 —— 直连端点在渲染进程会被 CORS 挡掉。
 ipcMain.handle('model:test', (_event, config = {}) => testModel(config))
 
-// 中断当前执行
-ipcMain.handle('agent:interrupt', () => {
-  if (agent) agent.interrupt()
+// 中断：只中断指定的那个会话，其它会话继续跑
+ipcMain.handle('agent:interrupt', (event, { chatId } = {}) => {
+  const ctx = ctxOf(event)
+  if (ctx) agentFor(ctx, chatId).interrupt()
   return { success: true }
 })
 
 // 用户回答了 ask_user 的提问，把答案回填给挂起中的 Agent
-ipcMain.handle('agent:answer', (event, { id, answer } = {}) => {
-  if (agent && id) return { success: agent.answerQuestion(id, answer) }
-  return { success: false }
+ipcMain.handle('agent:answer', (event, { id, answer, chatId } = {}) => {
+  const ctx = ctxOf(event)
+  if (!ctx || !id) return { success: false }
+  return { success: agentFor(ctx, chatId).answerQuestion(id, answer) }
 })
 
-// 让 Agent 的工作目录跟随左侧资源管理器打开的目录
-ipcMain.handle('agent:set-project-dir', (event, { dirPath }) => {
-  if (agent && dirPath) agent.setProjectDir(dirPath)
+// 让 Agent 的工作目录跟随左侧资源管理器打开的目录（该窗口下所有会话一起切）
+ipcMain.handle('agent:set-project-dir', (event, { dirPath } = {}) => {
+  const ctx = ctxOf(event)
+  if (!ctx || !dirPath) return { success: true }
+  ctx.settings.projectDir = dirPath
+  forEachAgent(ctx, (a) => a.setProjectDir?.(dirPath))
   return { success: true }
 })
 
@@ -965,7 +1170,7 @@ ipcMain.handle('agent:set-project-dir', (event, { dirPath }) => {
 // 拿不到再退回「按名字扫全工程」。LSP 不可用时是静默降级，不影响原来的体验。
 ipcMain.handle('search:symbol', async (event, { name, filePath, line, column } = {}) => {
   if (!name) return []
-  const dir = allowedDir || (agent && agent.projectDir) || process.cwd()
+  const dir = ctxOf(event)?.allowedDir || process.cwd()
   if (filePath && line) {
     try {
       const hit = await lsp.findDefinition(dir, filePath, line, column || 1)
@@ -987,61 +1192,81 @@ ipcMain.handle('search:symbol', async (event, { name, filePath, line, column } =
   }
 })
 
-ipcMain.handle('agent:clear', () => {
-  if (agent) agent.clearContext()
+ipcMain.handle('agent:clear', (event, { chatId } = {}) => {
+  const ctx = ctxOf(event)
+  if (ctx) agentFor(ctx, chatId).clearContext()
 })
 
 // 把「已安装且启用」的扩展同步给 Agent，让设置页的安装/开关真正生效
-ipcMain.handle('agent:set-extensions', (event, { extensions }) => {
-  if (agent) agent.setExtensions(extensions)
+ipcMain.handle('agent:set-extensions', (event, { extensions } = {}) => {
+  const ctx = ctxOf(event)
+  if (!ctx) return { success: true }
+  ctx.settings.extensions = Array.isArray(extensions) ? extensions : []
+  forEachAgent(ctx, (a) => a.setExtensions?.(ctx.settings.extensions))
   return { success: true }
 })
 
 // 计划模式：只读规划，改文件/执行命令会被 Agent 拦下
-ipcMain.handle('agent:set-plan-mode', (_event, { enabled } = {}) => {
-  if (agent) agent.setPlanMode(enabled)
+ipcMain.handle('agent:set-plan-mode', (event, { enabled } = {}) => {
+  const ctx = ctxOf(event)
+  if (!ctx) return { success: true, planMode: Boolean(enabled) }
+  ctx.settings.planMode = Boolean(enabled)
+  forEachAgent(ctx, (a) => a.setPlanMode?.(Boolean(enabled)))
   return { success: true, planMode: Boolean(enabled) }
 })
 
 // 内置能力清单：如实展示哪些能力已原生生效、不需要装 Pi 扩展
-ipcMain.handle('builtins:list', () => (agent ? agent.builtinCapabilities() : builtinsEngine.list(null)))
+ipcMain.handle('builtins:list', (event) => {
+  const ctx = ctxOf(event)
+  const a = ctx ? ctx.agents.values().next().value : null
+  return a ? a.builtinCapabilities() : builtinsEngine.list(null)
+})
 
 // 危险操作确认开关：护栏命中时是「弹卡问用户」还是「直接拦下」
-ipcMain.handle('agent:set-risk-confirm', (_event, { enabled } = {}) => {
-  if (agent) agent.setRiskConfirm(enabled)
+ipcMain.handle('agent:set-risk-confirm', (event, { enabled } = {}) => {
+  const ctx = ctxOf(event)
+  if (!ctx) return { success: true, askBeforeRisk: Boolean(enabled) }
+  ctx.settings.riskConfirm = Boolean(enabled)
+  forEachAgent(ctx, (a) => a.setRiskConfirm?.(Boolean(enabled)))
   return { success: true, askBeforeRisk: Boolean(enabled) }
 })
 
 // 改完文件是否自动把诊断结果回灌给 Agent
-ipcMain.handle('agent:set-auto-diagnostics', (_event, { enabled } = {}) => {
-  if (agent) agent.setAutoDiagnostics(enabled)
+ipcMain.handle('agent:set-auto-diagnostics', (event, { enabled } = {}) => {
+  const ctx = ctxOf(event)
+  if (!ctx) return { success: true, autoDiagnostics: Boolean(enabled) }
+  ctx.settings.autoDiagnostics = Boolean(enabled)
+  forEachAgent(ctx, (a) => a.setAutoDiagnostics?.(Boolean(enabled)))
   return { success: true, autoDiagnostics: Boolean(enabled) }
 })
 
 // 把某个会话的历史灌回 Agent 上下文（切换会话、或重启后接着上次聊）
 // chatId 是前端的聊天标签 id：Pi 后端按它对应一个 pi 会话，换标签就是换会话
-ipcMain.handle('agent:load-context', (_event, { messages, chatId } = {}) => {
-  if (agent) agent.loadContext({ messages, chatId })
+ipcMain.handle('agent:load-context', (event, { messages, chatId } = {}) => {
+  const ctx = ctxOf(event)
+  if (!ctx) return { success: true }
+  agentFor(ctx, chatId).loadContext({ messages, chatId })
   return { success: true }
 })
 
 // 列出 / 回退改动检查点（原生内置，等价于 Pi 的 git-checkpoint 扩展）
-ipcMain.handle('checkpoints:list', () => {
-  const dir = allowedDir || (agent && agent.projectDir) || process.cwd()
-  return checkpointEngine.list(dir)
+ipcMain.handle('checkpoints:list', (event) => {
+  return checkpointEngine.list(ctxOf(event)?.allowedDir || process.cwd())
 })
 
-ipcMain.handle('checkpoints:restore', (_event, { sha, removePaths } = {}) => {
-  const dir = allowedDir || (agent && agent.projectDir) || process.cwd()
-  return checkpointEngine.restore(dir, sha, { removePaths })
+ipcMain.handle('checkpoints:restore', (event, { sha, removePaths } = {}) => {
+  return checkpointEngine.restore(ctxOf(event)?.allowedDir || process.cwd(), sha, { removePaths })
 })
 
 // 编辑历史消息重跑：把 Agent 的对话上下文退回那条消息之前。
 // pi 后端用它自己的 fork（会话存在 pi 里，改不了上下文），自研后端直接整段替换。
-ipcMain.handle('agent:rewind', async (_event, payload = {}) => {
-  if (!agent || typeof agent.rewind !== 'function') return { ok: false, error: '当前后端不支持回退' }
+ipcMain.handle('agent:rewind', async (event, payload = {}) => {
+  const ctx = ctxOf(event)
+  if (!ctx) return { ok: false, error: 'Window not found' }
+  const a = agentFor(ctx, payload.chatId)
+  if (typeof a.rewind !== 'function') return { ok: false, error: '当前后端不支持回退' }
   try {
-    return await agent.rewind(payload)
+    return await a.rewind(payload)
   } catch (e) {
     return { ok: false, error: e?.message || String(e) }
   }
@@ -1110,13 +1335,13 @@ ipcMain.handle('app:version', () => app.getVersion())
 // 数据量很小（几 KB 的 JSON），同步读取的开销可以接受。
 //
 // 快照里的「上次工作目录」在这里顺手校正一次，否则界面会先按旧目录渲染一遍
-// （文件树、终端、Agent 都跟着走），之后才被 folder:open 纠正过来：
-//   - 右键「用 Yu Code 打开」传入的目录优先 —— 它才是用户这一次要打开的工作区；
+// （文件树、终端、Agent 都跟着走），之后才被纠正过来：
+//   - 这个窗口自己的目标目录优先 —— 它是用户这一次要打开的工作区（多开时各不一样）；
 //   - 上次的目录若已被删除/改名，直接去掉 —— 否则启动即报「读取目录失败」，
 //     终端也会拿这个不存在的目录去 spawn。
 ipcMain.on('state:load-sync', (event) => {
   const state = { ...stateStore.getAll() }
-  const launchDir = launchTargetDir()
+  const launchDir = ctxOf(event)?.allowedDir || ''
   if (launchDir) {
     state['pi-current-dir'] = launchDir
   } else if (state['pi-current-dir'] && !isExistingDir(state['pi-current-dir'])) {
@@ -1129,13 +1354,15 @@ ipcMain.on('state:save', (_event, patch) => {
   stateStore.set(patch)
 })
 
-// Window controls
-ipcMain.on('window:minimize', () => mainWindow?.minimize())
-ipcMain.on('window:maximize', () => {
-  if (mainWindow?.isMaximized()) mainWindow.unmaximize()
-  else mainWindow?.maximize()
+// Window controls（哪个窗口点的按钮就操作哪个窗口）
+ipcMain.on('window:minimize', (event) => ctxWin(event)?.minimize())
+ipcMain.on('window:maximize', (event) => {
+  const win = ctxWin(event)
+  if (!win) return
+  if (win.isMaximized()) win.unmaximize()
+  else win.maximize()
 })
-ipcMain.on('window:close', () => mainWindow?.close())
+ipcMain.on('window:close', (event) => ctxWin(event)?.close())
 
 // ─── 系统右键"用 Yu Code 打开"────────────────────────────────────────────────
 // 从命令行参数里挑出路径。argv[0] 是 Electron 自身（形如 E:\...\electron.exe），必须排除，
@@ -1159,59 +1386,78 @@ function launchTargetDir() {
   return isExistingDir(target) ? target : ''
 }
 
+// macOS：open-file 事件可能在 app ready 之前触发，先存下来
+let pendingOsOpen = null
+
 // 目录 → 当成工作区打开；文件 → 在编辑器里打开
-function dispatchOsOpen(target) {
-  if (!target || !mainWindow || mainWindow.isDestroyed()) return
+function dispatchOsOpen(ctx, target) {
+  if (!ctx || !target || ctx.win.isDestroyed()) return
   // 路径不存在时按文件处理，交给渲染进程提示打开失败
-  mainWindow.webContents.send(isExistingDir(target) ? 'folder:open' : 'file:open', target)
+  safeSend(ctx.win.webContents, isExistingDir(target) ? 'folder:open' : 'file:open', target)
 }
 
 // 派发右键传入的路径。渲染进程还没挂载就先记下来，
 // 等它注册好监听并发来 app:renderer-ready 再补发——否则冷启动时事件丢失，
 // 界面只会显示上次持久化的工作目录（表现为"打开了上级目录"）。
-function queueOsOpen(target) {
-  if (!target) return
-  if (!rendererReady) {
-    pendingOsOpen = target
+function queueOsOpen(ctx, target) {
+  if (!ctx || !target) return
+  if (!ctx.rendererReady) {
+    ctx.pendingOpen = target
     return
   }
-  dispatchOsOpen(target)
+  dispatchOsOpen(ctx, target)
 }
 
-ipcMain.on('app:renderer-ready', () => {
-  rendererReady = true
-  const target = pendingOsOpen
-  pendingOsOpen = null
-  dispatchOsOpen(target)
+/**
+ * 打开一个来自系统（右键 / 启动参数 / 菜单选择）的路径，是多开的统一入口：
+ *   目录 → 已经打开就聚焦那个窗口，没打开就新起一个窗口（原来的窗口保持不变）；
+ *   文件 → 在聚焦窗口里打开（没有窗口就新建一个）。
+ */
+function openTarget(target) {
+  if (!target) {
+    // 没有具体路径（例如重复点击图标）：聚焦已有窗口
+    const win = firstWindow()
+    if (win) {
+      if (win.isMinimized()) win.restore()
+      win.focus()
+    } else {
+      createWindow('')
+    }
+    return { ok: true, opened: 'focused' }
+  }
+
+  if (isExistingDir(target)) {
+    const resolved = path.resolve(target)
+    // 该目录已经打开过：聚焦原来的窗口，不再新起，避免同一个工作区开两遍
+    for (const ctx of windows.values()) {
+      if (ctx.win.isDestroyed()) continue
+      if (ctx.allowedDir && path.resolve(ctx.allowedDir) === resolved) {
+        if (ctx.win.isMinimized()) ctx.win.restore()
+        ctx.win.focus()
+        return { ok: true, dir: resolved, opened: 'focused' }
+      }
+    }
+    createWindow(resolved)
+    return { ok: true, dir: resolved, opened: 'created' }
+  }
+
+  // 文件：在当前聚焦的窗口里打开；一个窗口都没有就先建一个
+  const focused = BrowserWindow.getFocusedWindow()
+  let ctx = focused ? windows.get(focused.webContents.id) : null
+  if (!ctx) ctx = windows.values().next().value
+  if (!ctx) createWindow(target)
+  else queueOsOpen(ctx, target)
+  return { ok: true, path: target, opened: 'created' }
+}
+
+ipcMain.on('app:renderer-ready', (event) => {
+  const ctx = ctxOf(event)
+  if (!ctx) return
+  ctx.rendererReady = true
+  const target = ctx.pendingOpen
+  ctx.pendingOpen = null
+  dispatchOsOpen(ctx, target)
 })
-
-// ─── Agent 后端选择 ─────────────────────────────────────────────────────────
-// 默认用内置的 pi CLI 当引擎：工具、扩展、子代理、技能全部由 pi 提供，本应用负责展示。
-// 自研引擎（YuCodeAgent）保留成回退路径，pi 不可用或显式要求时启用。
-// 切换方式：环境变量 YUCODE_AGENT_BACKEND=native|pi，或状态文件里的 agentBackend。
-function pickBackend() {
-  const fromEnv = String(process.env.YUCODE_AGENT_BACKEND || '').trim().toLowerCase()
-  if (fromEnv === 'native' || fromEnv === 'pi') return fromEnv
-  const saved = stateStore.getAll()?.agentBackend
-  if (saved === 'native' || saved === 'pi') return saved
-  return 'pi'
-}
-
-function createAgent() {
-  const wanted = pickBackend()
-  const usePi = wanted === 'pi' && piRuntime.getPiInfo().available
-  if (wanted === 'pi' && !usePi) {
-    console.warn('[agent] 没有找到 pi CLI，回退到自研引擎')
-  }
-  if (usePi) {
-    // pi 的会话落盘在 userData 下，不和用户自己的 ~/.pi 混在一起
-    return new PiAgent(mainWindow, __dirname + '/..', {
-      sessionDir: path.join(app.getPath('userData'), 'pi-sessions'),
-    })
-  }
-  const native = new YuCodeAgent(mainWindow, __dirname + '/..')
-  return native
-}
 
 app.whenReady().then(() => {
   // 状态文件路径依赖 app.getPath('userData')，必须在 app ready 之后再初始化
@@ -1220,36 +1466,42 @@ app.whenReady().then(() => {
   // 免得往用户的桌面/项目目录里塞东西。
   checkpointEngine.setStoreRoot(path.join(app.getPath('userData'), 'code-snapshots'))
   // 先建窗口，再去做耗时的同步初始化：启动进度条要在第一时间就能看到。
-  createWindow()
+  // 启动参数里的目录/文件由窗口自己带过去（多开时每个窗口各有自己的目标）。
+  createWindow(pathArgsFrom(process.argv)[0] || '')
   // 内置扩展：把随包分发的扩展补进 pi 的包目录，必须在建 Agent 之前完成。
   // 只在扩展集合变化时做一次，之后用户自己的增删不会被覆盖。
   bundledExtensions.ensure()
   // 自定义扩展（后台任务、项目规则写入）：写进 pi 的全局扩展目录，让 pi 起会话时
   // 自动加载。同样要在建 Agent 之前完成。
   customExtensions.ensure()
-  agent = createAgent()
 
   // MCP 客户端：内置 git server 开箱即连，用户自加的 server 落盘在 userData 下。
   // 连不上只是这个 server 不可用，不影响应用启动，所以这里不 await。
   mcp = new McpManager(path.join(app.getPath('userData'), 'mcp-servers.json'))
-  mcp.setProjectDir(agent.projectDir)
-  agent.setMcp(mcp)
+  mcp.setProjectDir(launchTargetDir() || stateStore.getAll()?.['pi-current-dir'] || process.cwd())
   mcp.connectAll().catch((e) => console.error('[mcp] 启动连接失败:', e?.message || e))
 
-  // 处理通过右键"用 Yu Code 打开"传入的路径。
-  // 不能在这里定时器硬发：冷启动时渲染进程要几秒才挂载完，固定延迟要么太早（事件丢失）
-  // 要么太晚（窗口已经亮着空目录）。改成等渲染进程就绪的信号。
-  queueOsOpen(pathArgsFrom(process.argv)[0])
+  // Agent 是惰性创建的（窗口真的发消息/切会话时才建），但可能已有窗口抢在
+  // mcp 初始化前就建好了会话，这里补一次 setMcp，避免它们拿不到 MCP 工具。
+  for (const ctx of windows.values()) forEachAgent(ctx, (a) => a.setMcp?.(mcp))
+
+  // macOS：ready 之前收到的 open-file 在这里补发
+  if (pendingOsOpen) {
+    const t = pendingOsOpen
+    pendingOsOpen = null
+    openTarget(t)
+  }
 
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow()
+    if (BrowserWindow.getAllWindows().length === 0) createWindow('')
   })
 })
 
-// macOS: open-file 事件
+// macOS: open-file 事件（把文件/目录拖到 Dock 图标上）
 app.on('open-file', (event, filePath) => {
   event.preventDefault()
-  queueOsOpen(filePath)
+  if (app.isReady()) openTarget(filePath)
+  else pendingOsOpen = filePath
 })
 
 // Windows: 单实例 + second-instance 接收新文件
@@ -1264,27 +1516,32 @@ if (isDev) {
     app.quit()
   } else {
     app.on('second-instance', (_event, argv) => {
-      const target = pathArgsFrom(argv)[0]
-      if (mainWindow) {
-        if (mainWindow.isMinimized()) mainWindow.restore()
-        mainWindow.focus()
-        // 走队列：窗口存在但渲染进程首次还没挂载完时，事件同样会丢
-        queueOsOpen(target)
-      }
+      // 带目录：已打开就聚焦，没打开就新起一个窗口（支持多开）；
+      // 不带目录（例如重复点图标）：聚焦已有窗口，不再新起。
+      openTarget(pathArgsFrom(argv)[0] || '')
     })
   }
 }
 
 app.on('window-all-closed', () => {
-  stopDirWatch()
+  try { stopAllWatches() } catch { /* 监听清理失败不能拦住退出 */ }
   if (process.platform !== 'darwin') app.quit()
 })
 
 // 退出前把防抖中未落盘的状态写掉，避免最后几步操作丢失；
-// 同时把 MCP / LSP / pi 拉起的子进程收干净，否则会留下孤儿进程占着端口
+// 同时把每个窗口的 MCP / LSP / pi 子进程收干净，否则会留下孤儿进程占着端口
 app.on('before-quit', () => {
   stateStore.flush()
-  try { agent?.shutdown?.() } catch { /* ignore */ }
+  // 终端（powershell/conhost 及其命令子进程）也必须在这里收掉：
+  // 有的退出路径不经过窗口 closed（或 closed 里 pty.kill 的异步清理来不及跑完），
+  // 残留的终端进程会把主进程卡死，表现为关闭应用后任务管理器仍有残余进程。
+  for (const id of [...terminals.keys()]) killTerminal(id)
+  for (const ctx of windows.values()) {
+    ctx.terminalIds.clear()
+    for (const a of ctx.agents.values()) {
+      try { a.shutdown?.() } catch { /* ignore */ }
+    }
+  }
   try { mcp?.disposeAll() } catch { /* ignore */ }
   try { lsp.disposeAll() } catch { /* ignore */ }
 })

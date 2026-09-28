@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { Message, AgentStatus, Model, Plugin, Skill, ExtensionCatalogItem, InstalledExtension, QueuedMessage, TokenUsage, AgentAsk } from '../types'
+import type { Message, AgentStatus, Model, Plugin, Skill, ExtensionCatalogItem, InstalledExtension } from '../types'
 import { storage } from './persist'
 import { getLanguageFromExt } from '../utils/language'
 
@@ -158,10 +158,6 @@ interface AppState {
   showNotice: (text: string) => void
   clearNotice: () => void
 
-  /** Agent 用 ask_user 抛出的提问；不为 null 时代表正在等用户回答 */
-  pendingAsk: AgentAsk | null
-  setPendingAsk: (ask: AgentAsk | null) => void
-
   // 界面外观
   uiSettings: UiSettings
   setUiSettings: (patch: Partial<UiSettings>) => void
@@ -171,11 +167,6 @@ interface AppState {
   agentStatus: AgentStatus
   history: { id: string; title: string; time: string }[]
   activeChatId: string | null
-
-  // Task queue
-  queue: QueuedMessage[]
-  isRunning: boolean
-  isInterrupted: boolean
 
   // File tree
   currentDir: string
@@ -257,13 +248,6 @@ interface AppState {
   removePythonEnv: (env: { name: string; path: string }) => void
   clearMessages: () => void
 
-  // Queue actions
-  enqueueMessage: (msg: QueuedMessage) => void
-  dequeueMessage: (id: string) => void
-  clearQueue: () => void
-  setRunning: (running: boolean) => void
-  setInterrupted: (interrupted: boolean) => void
-
   // Extension actions
   /** 重新扫描已安装扩展 + 拉取可安装清单 */
   refreshExtensions: () => Promise<void>
@@ -273,10 +257,6 @@ interface AppState {
   /** 启用 / 禁用已安装扩展；禁用后其 Skill 不再注入 Agent */
   toggleExtension: (id: string) => void
   clearExtMessage: () => void
-
-  // Token usage
-  tokenUsage: TokenUsage
-  setTokenUsage: (usage: Partial<TokenUsage>) => void
 
   // File operations
   newFile: () => void
@@ -370,19 +350,10 @@ export const useAppStore = create<AppState>((set, get) => ({
   removedPythonEnvPaths: loadRemovedPythonEnvs(),
   planMode: false,
 
-  // Queue state
-  queue: [],
-  isRunning: false,
-  isInterrupted: false,
-
-  // Token usage
-  tokenUsage: { inputTokens: 0, outputTokens: 0, inputLimit: 0, contextWindow: 0, tokensPerSecond: 0, live: false },
-
   setPanelSizes: (sizes) => set((s) => ({ panelSizes: { ...s.panelSizes, ...sizes } })),
   setSettingsOpen: (open) => set({ settingsOpen: open }),
   showNotice: (text) => set({ notice: { id: Date.now(), text } }),
   clearNotice: () => set({ notice: null }),
-  setPendingAsk: (ask) => set({ pendingAsk: ask }),
   addMessage: (msg) => set((s) => ({ messages: [...s.messages, msg] })),
   setAgentStatus: (status) => set({ agentStatus: status }),
   newChat: () => set((s) => {
@@ -542,13 +513,6 @@ export const useAppStore = create<AppState>((set, get) => ({
   }),
   clearMessages: () => set({ messages: [], agentStatus: { state: 'idle' } }),
 
-  // Queue actions
-  enqueueMessage: (msg) => set((s) => ({ queue: [...s.queue, msg] })),
-  dequeueMessage: (id) => set((s) => ({ queue: s.queue.filter((q) => q.id !== id) })),
-  clearQueue: () => set({ queue: [] }),
-  setRunning: (running) => set({ isRunning: running }),
-  setInterrupted: (interrupted) => set({ isInterrupted: interrupted }),
-
   // Extension actions
   refreshExtensions: async () => {
     const api = window.piAPI
@@ -619,11 +583,6 @@ export const useAppStore = create<AppState>((set, get) => ({
   }),
   clearExtMessage: () => set({ extMessage: null }),
 
-  // Token usage
-  setTokenUsage: (usage) => set((s) => ({
-    tokenUsage: { ...s.tokenUsage, ...usage },
-  })),
-
   // File operations
   newFile: () => {
     if (window.piAPI?.createFile) {
@@ -631,17 +590,8 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
   openFolder: async () => {
-    if (window.piAPI?.openFolder) {
-      const dir = await window.piAPI.openFolder()
-      if (dir) {
-        set({ currentDir: dir })
-        saveCurrentDir(dir)
-        window.piAPI.setAllowedDir(dir)
-        window.piAPI.setAgentProjectDir?.(dir)
-      }
-    } else {
-      // Fallback: just set a default path
-      set({ currentDir: 'C:\\Users' })
-    }
+    // 菜单「打开文件夹」→ 在新的窗口里打开，当前窗口的工作区保持不变（支持多开）。
+    // 若选中的目录已经在别的窗口打开，主进程会把那个窗口拉到前台，不再新起。
+    await window.piAPI?.openFolderInNewWindow?.()
   },
 }))

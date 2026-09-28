@@ -9,6 +9,24 @@ try {
   /* 主进程尚未就绪时降级为空状态 */
 }
 
+/**
+ * Agent 事件都从主进程的「每会话 shim」发出，统一带一层 { __chatId, data }。
+ * 这里解包，把业务数据交给回调、把 chatId 作为第二参数交出去，
+ * 界面就能把事件投递到对应会话的时间线（同一窗口多会话并发靠它）。
+ */
+function onAgentEvent(channel, callback) {
+  const listener = (_event, payload) => {
+    if (payload && typeof payload === 'object' && '__chatId' in payload) {
+      callback(payload.data, payload.__chatId)
+    } else {
+      // 兼容：万一有事件没经 shim（例如主进程直发），原样交给回调
+      callback(payload, undefined)
+    }
+  }
+  ipcRenderer.on(channel, listener)
+  return () => ipcRenderer.removeListener(channel, listener)
+}
+
 contextBridge.exposeInMainWorld('piAPI', {
   // 工作区状态（文件存储）
   initialState,
@@ -45,7 +63,8 @@ contextBridge.exposeInMainWorld('piAPI', {
   openFolderDialog: () => ipcRenderer.invoke('dialog:open-folder'),
   openFileDialog: () => ipcRenderer.invoke('dialog:open-file'),
   createFile: () => ipcRenderer.invoke('file:create'),
-  openFolder: () => ipcRenderer.invoke('folder:open-and-set'),
+  /** 菜单「打开文件夹」：选一个目录，在新窗口里作为工作区打开（原窗口保持不变） */
+  openFolderInNewWindow: () => ipcRenderer.invoke('window:open-folder'),
 
   // Python environments
   listPythonEnvs: () => ipcRenderer.invoke('python:list-envs'),
@@ -86,23 +105,21 @@ contextBridge.exposeInMainWorld('piAPI', {
   browserScreenshot: () => ipcRenderer.invoke('browser:screenshot'),
   browserClose: () => ipcRenderer.invoke('browser:close'),
 
-  // Agent
-  sendToAgent: (message) => ipcRenderer.invoke('agent:send', { message }),
-  setAgentModel: (config) => ipcRenderer.invoke('agent:set-model', config),
+  // Agent（chatId 标识窗口内的哪个会话，多会话并发时不能省）
+  /** 发消息；model 是这个会话绑定的模型配置（不同会话可以用不同模型） */
+  sendToAgent: (message, chatId, model) => ipcRenderer.invoke('agent:send', { message, chatId, model }),
+  /** 下发模型：带 chatId 只作用于该会话，不带则作为窗口默认广播给全部会话 */
+  setAgentModel: (config, chatId) => ipcRenderer.invoke('agent:set-model', { config, chatId }),
   /** 模型连通性自测：登记到 Pi + 直连端点 + pi 是否识别，返回逐步结果 */
   testModel: (config) => ipcRenderer.invoke('model:test', config),
-  interruptAgent: () => ipcRenderer.invoke('agent:interrupt'),
+  interruptAgent: (chatId) => ipcRenderer.invoke('agent:interrupt', { chatId }),
   setAgentProjectDir: (dirPath) => ipcRenderer.invoke('agent:set-project-dir', { dirPath }),
   /** 同步「已安装且启用」的扩展，会注入到 Agent 系统提示词 */
   setAgentExtensions: (extensions) => ipcRenderer.invoke('agent:set-extensions', { extensions }),
   /** 计划模式：开启后 Agent 只读不改，先出计划 */
   setPlanMode: (enabled) => ipcRenderer.invoke('agent:set-plan-mode', { enabled }),
   /** Agent 自己切换计划模式（例如计划获批后自动退出），界面要同步开关状态 */
-  onAgentPlanMode: (callback) => {
-    const listener = (_event, enabled) => callback(Boolean(enabled))
-    ipcRenderer.on('agent:plan-mode', listener)
-    return () => ipcRenderer.removeListener('agent:plan-mode', listener)
-  },
+  onAgentPlanMode: (callback) => onAgentEvent('agent:plan-mode', callback),
   /** 护栏命中时是先弹卡问用户（true）还是直接拦下（false） */
   setRiskConfirm: (enabled) => ipcRenderer.invoke('agent:set-risk-confirm', { enabled }),
   /** 改完文件是否自动把诊断结果回灌给 Agent */
@@ -111,11 +128,7 @@ contextBridge.exposeInMainWorld('piAPI', {
    *  chatId 是聊天标签 id：Pi 后端按「目录 + 标签」对应一个 pi 会话 */
   loadAgentContext: (messages, chatId) => ipcRenderer.invoke('agent:load-context', { messages, chatId }),
   /** Agent 的任务清单（todo_write 维护），界面实时显示进度 */
-  onAgentTodos: (callback) => {
-    const listener = (_event, todos) => callback(todos)
-    ipcRenderer.on('agent:todos', listener)
-    return () => ipcRenderer.removeListener('agent:todos', listener)
-  },
+  onAgentTodos: (callback) => onAgentEvent('agent:todos', callback),
   /** 内置能力清单：已原生生效、不依赖 Pi 扩展的那些 */
   listBuiltins: () => ipcRenderer.invoke('builtins:list'),
   /** 改动检查点：列出 / 回退到某个快照 */
@@ -124,11 +137,7 @@ contextBridge.exposeInMainWorld('piAPI', {
   /** 编辑历史消息重跑前，把 Agent 上下文退回那条消息之前 */
   rewindAgent: (payload) => ipcRenderer.invoke('agent:rewind', payload),
   /** Agent 每轮任务开始前打下的检查点 */
-  onAgentCheckpoint: (callback) => {
-    const listener = (_event, payload) => callback(payload)
-    ipcRenderer.on('agent:checkpoint', listener)
-    return () => ipcRenderer.removeListener('agent:checkpoint', listener)
-  },
+  onAgentCheckpoint: (callback) => onAgentEvent('agent:checkpoint', callback),
 
   // Extensions（安装 / 卸载 / 状态一律走内置的 pi CLI）
   /** 扫描已安装：放进 skills 目录的 Skill + Pi 包里的 Skill + pi CLI 认的包本身 */
@@ -154,41 +163,19 @@ contextBridge.exposeInMainWorld('piAPI', {
   toggleMcpServer: (id, enabled) => ipcRenderer.invoke('mcp:toggle', { id, enabled }),
   /** 不带 id 时重连全部启用的 server */
   refreshMcpServers: (id) => ipcRenderer.invoke('mcp:refresh', { id }),
-  onAgentResponse: (callback) => {
-    const listener = (_event, data) => callback(data)
-    ipcRenderer.on('agent:response', listener)
-    return () => ipcRenderer.removeListener('agent:response', listener)
-  },
-  onAgentStatus: (callback) => {
-    const listener = (_event, status) => callback(status)
-    ipcRenderer.on('agent:status', listener)
-    return () => ipcRenderer.removeListener('agent:status', listener)
-  },
+  onAgentResponse: (callback) => onAgentEvent('agent:response', callback),
+  onAgentStatus: (callback) => onAgentEvent('agent:status', callback),
   /** 真实 token 用量（来自 API 的 usage），显示在对话框最下方 */
-  onAgentUsage: (callback) => {
-    const listener = (_event, payload) => callback(payload)
-    ipcRenderer.on('agent:usage', listener)
-    return () => ipcRenderer.removeListener('agent:usage', listener)
-  },
-  onAgentStream: (callback) => {
-    const listener = (_event, delta) => callback(delta)
-    ipcRenderer.on('agent:stream', listener)
-    return () => ipcRenderer.removeListener('agent:stream', listener)
-  },
+  onAgentUsage: (callback) => onAgentEvent('agent:usage', callback),
+  /** 服务端报出真实的上下文上限，界面要把模型配置里的 contextWindow 改过来并持久化 */
+  onModelCorrected: (callback) => onAgentEvent('agent:model-corrected', callback),
+  onAgentStream: (callback) => onAgentEvent('agent:stream', callback),
   /** 每次文件改动推来的 diff（用于把「改了什么」展示给用户） */
-  onAgentDiff: (callback) => {
-    const listener = (_event, payload) => callback(payload)
-    ipcRenderer.on('agent:diff', listener)
-    return () => ipcRenderer.removeListener('agent:diff', listener)
-  },
+  onAgentDiff: (callback) => onAgentEvent('agent:diff', callback),
   /** Agent 用 ask_user 提问，等用户作答后才继续 */
-  onAgentAsk: (callback) => {
-    const listener = (_event, payload) => callback(payload)
-    ipcRenderer.on('agent:ask', listener)
-    return () => ipcRenderer.removeListener('agent:ask', listener)
-  },
-  /** 回答 ask_user 的提问 */
-  answerAgent: (id, answer) => ipcRenderer.invoke('agent:answer', { id, answer }),
+  onAgentAsk: (callback) => onAgentEvent('agent:ask', callback),
+  /** 回答 ask_user 的提问（chatId 指明是哪个会话在问） */
+  answerAgent: (id, answer, chatId) => ipcRenderer.invoke('agent:answer', { id, answer, chatId }),
   /** ctrl+左键跳转：优先 LSP 语义定义，拿不到再按名字在工程里找。
    *  at 是点击处的位置（1-based），有它 LSP 才能判断光标下是哪个符号 */
   findSymbol: (name, at) => ipcRenderer.invoke('search:symbol', { name, ...(at || {}) }),

@@ -44,6 +44,8 @@ export interface AgentStatusEvent extends AgentStatus {
   isError?: boolean
   durationMs?: number
   noticeType?: 'info' | 'warning' | 'error'
+  /** 完整的命令原文（detail 里的只截了前 50 字符），供界面复制 */
+  command?: string
 }
 
 /** 一次文件改动的差异，展示在过程时间线里 */
@@ -72,6 +74,8 @@ export interface ProcessEvent {
   ref?: string
   /** tool 的实时输出（长命令跑的时候的输出） */
   output?: string
+  /** tool 的完整命令原文（detail 只截断显示），供复制 */
+  command?: string
   status?: 'running' | 'done' | 'error'
   durationMs?: number
   /** kind === 'diff' 时的改动详情 */

@@ -44,6 +44,7 @@ export function appendStatusEvent(prev: ProcessEvent[], status: AgentStatusEvent
         state: status.state,
         detail: status.detail,
         ref: status.toolCallId,
+        command: status.command,
         status: 'running',
       }]
   }
@@ -68,6 +69,8 @@ function claimRunningTool(events: ProcessEvent[], status: AgentStatusEvent): Pro
     state: status.state,
     detail: status.detail || current.detail,
     ref: status.toolCallId || current.ref,
+    // 先来的「正在执行」只有工具名，带命令的那条认领它时把全文补上
+    command: status.command || current.command,
     status: 'running',
   }
   return next
@@ -167,6 +170,8 @@ export type ToolItem = {
   ref?: string
   /** 工具跑的时候的输出（长命令就靠它看到进度） */
   output?: string
+  /** 完整命令原文（text 里的只截了前 50 字符），复制按钮拿它 */
+  command?: string
   status?: 'running' | 'done' | 'error'
   durationMs?: number
 }
@@ -197,6 +202,7 @@ export function buildTimeline(events: ProcessEvent[], settle = false): TimelineN
         state,
         ref: ev.ref,
         output: ev.output,
+        command: ev.command,
         status: running ? 'running' : (settle && ev.status === 'running' ? undefined : ev.status),
         durationMs: ev.durationMs,
       }

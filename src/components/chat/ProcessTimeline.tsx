@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, type MouseEvent } from 'react'
 import type { AgentStatus, ProcessEvent } from '../../types'
 import Markdown from '../common/Markdown'
 import DiffCard from './DiffCard'
@@ -133,6 +133,7 @@ function ToolGroup({ state, items }: { state: string; items: ToolItem[] }) {
                 <ToolIcon state={state} />
                 <span className={`truncate ${item.status === 'error' ? 'text-red-400' : ''}`}>{item.text}</span>
                 <ToolStateMark status={item.status} durationMs={item.durationMs} />
+                {item.command && <CopyButton text={item.command} label="复制命令" />}
               </div>
               {item.output && <ToolOutput output={item.output} failed={item.status === 'error'} />}
             </div>
@@ -140,6 +141,48 @@ function ToolGroup({ state, items }: { state: string; items: ToolItem[] }) {
         </div>
       )}
     </div>
+  )
+}
+
+/**
+ * 复制按钮：时间线里展示的命令只截了前 50 字符，复制要给完整原文，
+ * 用户拿去终端重跑才有意义。剪贴板 API 不可用时退回 execCommand。
+ */
+function CopyButton({ text, label }: { text: string; label: string }) {
+  const [copied, setCopied] = useState(false)
+
+  const copy = async (e: MouseEvent<HTMLElement>) => {
+    e.stopPropagation() // 别触发外层「展开/收起」的点击
+    try {
+      await navigator.clipboard.writeText(text)
+    } catch {
+      const ta = document.createElement('textarea')
+      ta.value = text
+      document.body.appendChild(ta)
+      ta.select()
+      document.execCommand('copy')
+      document.body.removeChild(ta)
+    }
+    setCopied(true)
+    setTimeout(() => setCopied(false), 1500)
+  }
+
+  if (copied) return <span className="shrink-0 text-[10px] text-emerald-400">已复制</span>
+  return (
+    <button
+      onClick={copy}
+      title={label}
+      aria-label={label}
+      className="shrink-0 text-pi-text-dim hover:text-pi-text transition-colors"
+    >
+      <svg width="12" height="12" viewBox="0 0 16 16" fill="none">
+        <rect x="5.5" y="5.5" width="8" height="8" rx="1.5" stroke="currentColor" strokeWidth="1.2" />
+        <path
+          d="M10.5 3.5v-1a1 1 0 0 0-1-1h-7a1 1 0 0 0-1 1v7a1 1 0 0 0 1 1h1"
+          stroke="currentColor" strokeWidth="1.2" strokeLinecap="round"
+        />
+      </svg>
+    </button>
   )
 }
 

@@ -103,7 +103,12 @@ class PiRpcSession {
 
     const child = spawn(info.nodePath, args, {
       cwd: this.cwd,
-      env: { ...process.env, ...this.extraEnv },
+      // ACP_AUTO_UPDATE=0 关掉用户级扩展 billion-context-pi（自名 ACP）的自更新：
+      // 它本来是查 npm 后自行 npm install 就地升级，再通过 notify 让界面弹一句
+      // 「ACP auto-updated x → y. Restart Pi to finish.」——在对话中途改自己安装包里的
+      // 代码风险不小，而那句提示对用户也没有信息量（重启由我们自己控制）。
+      // 用户要升级时仍可手动 pi update --extension npm:billion-context-pi。
+      env: { ...process.env, ACP_AUTO_UPDATE: '0', ...this.extraEnv },
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
     })

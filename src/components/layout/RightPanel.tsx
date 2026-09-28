@@ -1,7 +1,8 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { useAppStore } from '../../stores/appStore'
 import { storage } from '../../stores/persist'
-import type { Message, AgentStreamDelta, ProcessEvent, AgentAsk, FileDiff, AgentTodo, TokenUsage } from '../../types'
+import type { Message, Model, AgentStreamDelta, ProcessEvent, AgentAsk, AgentStatusEvent, FileDiff, AgentTodo, TokenUsage, QueuedMessage } from '../../types'
+import type { AgentModelConfig } from '../../types/electron'
 import Markdown from '../common/Markdown'
 import ConfirmDialog from '../common/ConfirmDialog'
 import AskUserCard from '../chat/AskUserCard'
@@ -14,6 +15,24 @@ interface ChatTab {
   title: string
   messages: Message[]
   version: number
+  /** 这个会话绑定用哪个模型。留空表示跟随窗口当前模型（新会话默认如此） */
+  modelId?: string
+}
+
+/** 模型配置 → 下发给主进程做登记的载荷 */
+function toModelPayload(m: Model): AgentModelConfig {
+  return {
+    provider: m.provider,
+    model: m.name,
+    apiKey: m.apiKey || '',
+    baseUrl: m.baseUrl || '',
+    contextWindow: m.contextWindow,
+    maxInputTokens: m.maxInputTokens,
+    maxOutputTokens: m.maxOutputTokens,
+    supportsMultimodal: m.supportsMultimodal,
+    disableThinking: m.disableThinking,
+    thinkingControl: m.thinkingControl,
+  }
 }
 
 /** 编辑历史消息重跑前的回退方案：代码退回哪、对话丢到哪、重跑什么 */
@@ -81,12 +100,44 @@ function hasFileChanges(messages: Message[]): boolean {
   return messages.some((m) => (m.process?.events ?? []).some((ev) => ev.kind === 'diff'))
 }
 
+/**
+ * 一个会话的运行态。会话之间各存一份，所以同一窗口里多个会话可以同时跑、
+ * 互不打扰（和 Trae 一致）：切到别的标签时，正在跑的那个继续在后台推进。
+ * 放在 ref 里（不放进 React state）是因为事件回调来得又密又快，
+ * 每来一个事件都整体重建对象代价太高；改完调 bump() 触发一次重渲染即可。
+ */
+interface TabRuntime {
+  running: boolean
+  status: AgentStatusEvent
+  events: ProcessEvent[]
+  liveContent: string
+  todos: AgentTodo[]
+  ask: AgentAsk | null
+  usage: TokenUsage
+  queue: QueuedMessage[]
+  /** 本轮任务开始的时间戳，用来算耗时 */
+  startedAt: number
+  /** 新一轮推理开始时，思考内容要新开一张卡片，而不是接在上一张后面 */
+  newThinking: boolean
+}
+
+const emptyRuntime = (): TabRuntime => ({
+  running: false,
+  status: { state: 'idle' },
+  events: [],
+  liveContent: '',
+  todos: [],
+  ask: null,
+  usage: { inputTokens: 0, outputTokens: 0, inputLimit: 0, contextWindow: 0, tokensPerSecond: 0, live: false },
+  queue: [],
+  startedAt: 0,
+  newThinking: false,
+})
+
 export default function RightPanel() {
   const {
-    models, activeModelId, setActiveModel, setAgentStatus, agentStatus,
-    isRunning, setRunning, queue, enqueueMessage, dequeueMessage,
-    tokenUsage, setTokenUsage, currentDir,
-    pendingAsk, setPendingAsk, showNotice,
+    models, activeModelId, setActiveModel, setAgentStatus,
+    currentDir, showNotice,
   } = useAppStore()
   // 只解析一次初始会话（loadChatState 带迁移副作用，不能重复调用）
   const chatInitRef = useRef<ChatState | null>(null)
@@ -103,13 +154,21 @@ export default function RightPanel() {
   const [editContent, setEditContent] = useState('')
   // 待确认的回退：要还原文件、删新建文件，动手前先把影响讲清楚
   const [pendingRevert, setPendingRevert] = useState<RevertPlan | null>(null)
-  // 过程时间线：思考 / 中途输出 / 工具动作，按真实发生顺序记录
-  const [processEvents, setProcessEvents] = useState<ProcessEvent[]>([])
-  // Agent 的任务清单（todo_write 推出），钉在输入框上方显示进度
-  const [todos, setTodos] = useState<AgentTodo[]>([])
-  // 本轮正在流式输出的正文
-  const [liveContent, setLiveContent] = useState('')
   const [attachments, setAttachments] = useState<{ name: string; type: string }[]>([])
+  // 每个会话各自的运行态（过程时间线、流式正文、清单、提问、用量、队列）
+  const runtimesRef = useRef<Map<string, TabRuntime>>(new Map())
+  // runtime 是 mutable 的 ref，改完靠这个计数触发重渲染
+  const [runtimeTick, setRuntimeTick] = useState(0)
+  const bump = useCallback(() => setRuntimeTick((n) => n + 1), [])
+  /** 取某个会话的运行态；没有就建一个空的 */
+  const runtimeOf = useCallback((chatId: string): TabRuntime => {
+    let rt = runtimesRef.current.get(chatId)
+    if (!rt) {
+      rt = emptyRuntime()
+      runtimesRef.current.set(chatId, rt)
+    }
+    return rt
+  }, [])
   const bottomRef = useRef<HTMLDivElement>(null)
   // 过程窗滚动容器：用来判断用户是否已经上拉离开底部
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -120,12 +179,19 @@ export default function RightPanel() {
   const abortRef = useRef<AbortController | null>(null)
   const modelSelectRef = useRef<HTMLDivElement>(null)
   const taskSelectRef = useRef<HTMLDivElement>(null)
-  const taskStartRef = useRef<number>(0)
 
   // 兜底：本地存储里的 activeTabId 可能失效（如历史数据不匹配），回退到第一个会话避免整页崩溃
   const activeTab = tabs.find((t) => t.id === activeTabId) ?? tabs[0]
-  const activeModel = models.find((m) => m.id === activeModelId)
+  // 会话绑定的模型优先；没绑（新会话）就跟随窗口当前模型。
+  // 绑定的模型被删掉时逐级回退，避免拿到 undefined 让界面和 Agent 都失去模型。
+  const activeModel =
+    models.find((m) => m.id === (activeTab.modelId || activeModelId)) ??
+    models.find((m) => m.id === activeModelId) ??
+    models[0]
   const supportsMultimodal = activeModel?.supportsMultimodal ?? false
+  // 当前显示的这个会话的运行态。切标签就是切它，别的会话照常在后台跑。
+  const rt = runtimeOf(activeTab.id)
+  const isRunning = rt.running
 
   // 持久化对话历史：写入「这些 tabs 所属」的工作目录，而不是当前目录，
   // 避免切换目录的那一帧把旧会话写进新目录。
@@ -137,7 +203,7 @@ export default function RightPanel() {
     } catch { /* ignore */ }
   }, [tabs, activeTabId])
 
-  // 切换工作区：载入该目录的历史会话，并清掉上一目录残留的过程时间线
+  // 切换工作区：载入该目录的历史会话，并清掉上一目录残留的运行态
   useEffect(() => {
     if (loadedDirRef.current === currentDir) return
     loadedDirRef.current = currentDir
@@ -145,10 +211,10 @@ export default function RightPanel() {
     setTabs(st.tabs)
     setActiveTabId(st.activeTabId)
     setTabsDir(currentDir)
-    setProcessEvents([])
-    setLiveContent('')
-    setTodos([])
-  }, [currentDir])
+    // 旧目录的会话已不再显示，其运行态一并丢弃（新目录的会话会重新建）
+    runtimesRef.current.clear()
+    bump()
+  }, [currentDir, bump])
 
   // 会话切换 / 重启后，把该会话的历史灌回主进程里的 Agent 上下文。
   // 上下文在主进程、会话在前端，两边不同步就会出现「界面有历史、模型却失忆」，
@@ -162,13 +228,23 @@ export default function RightPanel() {
     const key = `${currentDir}::${activeTabId}`
     if (contextKeyRef.current === key) return
     contextKeyRef.current = key
+    // 这个会话正在后台跑：绝不能重灌上下文、也不能清它的运行态，
+    // 否则切回来看一眼就会把它的进度冲掉（多会话并发的前提）。
+    if (runtimeOf(activeTabId).running) return
     const msgs = (tabs.find((t) => t.id === activeTabId)?.messages ?? []).map((m) => ({
       role: m.role,
       content: m.content,
     }))
     window.piAPI?.loadAgentContext?.(msgs, activeTabId)
-    setTodos([])
-  }, [currentDir, activeTabId, tabs, tabsDir])
+    runtimeOf(activeTabId).todos = []
+    bump()
+  }, [currentDir, activeTabId, tabs, tabsDir, runtimeOf, bump])
+
+  // 顶部状态条显示「当前这个会话」的状态。后台会话在跑不影响它 ——
+  // 切过去才会看到那个会话的在跑状态（render 用 rt.status，这里只为 StatusBar 同步一份）。
+  useEffect(() => {
+    setAgentStatus(runtimesRef.current.get(activeTabId)?.status ?? { state: 'idle' })
+  }, [activeTabId, runtimeTick, setAgentStatus])
 
   // Auto-resize textarea
   const autoResize = useCallback(() => {
@@ -204,7 +280,7 @@ export default function RightPanel() {
   useEffect(() => {
     if (!autoFollowRef.current) return
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [activeTab.messages, agentStatus, processEvents, liveContent])
+  }, [activeTab.id, activeTab.messages, rt.status, rt.events, rt.liveContent])
 
   // Close model dropdown on outside click
   useEffect(() => {
@@ -228,15 +304,24 @@ export default function RightPanel() {
 
   const closeTab = (id: string) => {
     if (tabs.length <= 1) return
+    // 关掉一个还在跑的会话：连它的 Agent 一起停掉，别留个看不见的任务在后台空转
+    if (runtimeOf(id).running) {
+      window.piAPI?.interruptAgent?.(id)
+    }
+    runtimesRef.current.delete(id)
     const newTabs = tabs.filter((t) => t.id !== id)
     setTabs(newTabs)
     if (activeTabId === id) setActiveTabId(newTabs[newTabs.length - 1].id)
+    bump()
   }
 
   // 同步模型配置到 Electron Agent。
   // 依赖不能只看 activeModelId：模型详情（地址、密钥、上下文）是就地编辑的，
   // 只改详情时 id 不变，以前那样就不会重新推送 —— pi 那边的登记还停在上一次的值。
   // 所以把参与登记的几个字段拼成一个签名，任一变化都重新同步。
+  //
+  // 只下发到「当前这个会话」（带 chatId）：会话之间可以各用各的模型，
+  // 切一次模型不该把别的会话正在用的模型一起改掉。
   const modelSignature = activeModel
     ? [
       activeModel.provider, activeModel.name, activeModel.apiKey || '', activeModel.baseUrl || '',
@@ -247,28 +332,30 @@ export default function RightPanel() {
 
   useEffect(() => {
     if (!window.piAPI || !activeModel) return
-    window.piAPI.setAgentModel({
-      provider: activeModel.provider,
-      model: activeModel.name,
-      apiKey: activeModel.apiKey || '',
-      baseUrl: activeModel.baseUrl || '',
-      contextWindow: activeModel.contextWindow,
-      maxInputTokens: activeModel.maxInputTokens,
-      maxOutputTokens: activeModel.maxOutputTokens,
-      supportsMultimodal: activeModel.supportsMultimodal,
-      disableThinking: activeModel.disableThinking,
-      thinkingControl: activeModel.thinkingControl,
-    })
-  }, [modelSignature]) // eslint-disable-line react-hooks/exhaustive-deps
+    window.piAPI.setAgentModel(toModelPayload(activeModel), activeTab.id)
+  }, [modelSignature, activeTab.id]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Electron 模式下监听 agent 响应和状态
   const isElectron = typeof window !== 'undefined' && !!window.piAPI
   const activeTabIdRef = useRef(activeTabId)
   activeTabIdRef.current = activeTabId
-  const processEventsRef = useRef(processEvents)
-  processEventsRef.current = processEvents
-  // 新一轮推理开始时，思考内容要新开一张卡片，而不是接在上一张后面
-  const newThinkingRef = useRef(false)
+  // tabs / handleSend 的最新值。事件回调、队列消费都可能在若干次渲染之后才触发，
+  // 直接闭包捕获会拿到旧值，这里用 ref 取最新的。
+  const tabsRef = useRef(tabs)
+  tabsRef.current = tabs
+  /**
+   * 某个会话实际该用哪个模型：绑了就用绑的，没绑用窗口当前模型。
+   * 每次发消息都按它把模型下发一遍 —— 会话的模型以「发消息那一刻」为准，
+   * 这样即便中途在设置里改过模型详情，也不会出现某会话还在用旧配置。
+   */
+  const modelForTab = (tabId: string): Model | undefined => {
+    const id = tabsRef.current.find((t) => t.id === tabId)?.modelId || activeModelId
+    return models.find((m) => m.id === id) ?? models.find((m) => m.id === activeModelId) ?? models[0]
+  }
+  const handleSendRef = useRef<(text?: string, chatId?: string, atts?: QueuedMessage['attachments']) => void>(() => {})
+  const processQueueRef = useRef<(chatId: string) => void>(() => {})
+  // 事件没带 chatId 时的兜底：当作当前显示的会话
+  const cidOf = (chatId?: string) => chatId || activeTabIdRef.current
 
   useEffect(() => {
     if (!isElectron) return
@@ -281,17 +368,19 @@ export default function RightPanel() {
     let cleanupTodos: (() => void) | undefined
     let cleanupPlanMode: (() => void) | undefined
     let cleanupUsage: (() => void) | undefined
+    let cleanupModelFix: (() => void) | undefined
 
     // 任务清单：Agent 每推进一步就推一次，界面据此显示进度
-    cleanupTodos = window.piAPI!.onAgentTodos((list) => {
-      setTodos(Array.isArray(list) ? list : [])
+    cleanupTodos = window.piAPI!.onAgentTodos((list, chatId) => {
+      runtimeOf(cidOf(chatId)).todos = Array.isArray(list) ? list : []
+      bump()
     })
 
     // 每轮任务开始前的检查点：挂到本轮的用户消息上 ——
     // 编辑那条消息重跑时，据此把代码退回它之前
-    cleanupCheckpoint = window.piAPI!.onAgentCheckpoint((cp) => {
+    cleanupCheckpoint = window.piAPI!.onAgentCheckpoint((cp, chatId) => {
       if (!cp || !cp.sha) return
-      const tabId = activeTabIdRef.current
+      const tabId = cidOf(chatId)
       setTabs((prev) => prev.map((t) => {
         if (t.id !== tabId) return t
         const at = t.messages.map((m) => m.role).lastIndexOf('user')
@@ -303,40 +392,45 @@ export default function RightPanel() {
     })
 
     // 流式增量：思考过程累积成「思考卡片」，正文逐字追加展示
-    cleanupStream = window.piAPI!.onAgentStream((delta: AgentStreamDelta) => {
+    cleanupStream = window.piAPI!.onAgentStream((delta: AgentStreamDelta, chatId) => {
       if (!delta || !delta.text) return
+      const r = runtimeOf(cidOf(chatId))
       if (delta.type === 'reasoning') {
-        setProcessEvents((prev) => {
-          const last = prev[prev.length - 1]
-          if (!newThinkingRef.current && last && last.kind === 'thinking') {
-            return [...prev.slice(0, -1), { ...last, text: (last.text || '') + delta.text }]
-          }
-          newThinkingRef.current = false
-          return [...prev, { kind: 'thinking', text: delta.text }]
-        })
+        const last = r.events[r.events.length - 1]
+        if (!r.newThinking && last && last.kind === 'thinking') {
+          r.events = [...r.events.slice(0, -1), { ...last, text: (last.text || '') + delta.text }]
+        } else {
+          r.newThinking = false
+          r.events = [...r.events, { kind: 'thinking', text: delta.text }]
+        }
       } else if (delta.type === 'content') {
-        setLiveContent((prev) => prev + delta.text)
+        r.liveContent += delta.text
       }
+      bump()
     })
 
     // 文件改动：把 diff 记进时间线，做完这步才看得到 AI 到底改了什么
-    cleanupDiff = window.piAPI!.onAgentDiff((diff: FileDiff) => {
+    cleanupDiff = window.piAPI!.onAgentDiff((diff: FileDiff, chatId) => {
       if (!diff || !diff.filePath) return
-      setProcessEvents((prev) => [...prev, { kind: 'diff', diff }])
-      newThinkingRef.current = true
+      const r = runtimeOf(cidOf(chatId))
+      r.events = [...r.events, { kind: 'diff', diff }]
+      r.newThinking = true
+      bump()
       // 这个文件要是正开在编辑器里，得把磁盘上的新内容刷进去 ——
       // 否则用户盯着旧内容，会以为 Agent 没改到地方。
       void useAppStore.getState().syncOpenFile(diff.filePath)
     })
 
     // ask_user：停在输入框上方等用户回答，回答后 Agent 才继续
-    cleanupAsk = window.piAPI!.onAgentAsk((ask: AgentAsk) => {
+    cleanupAsk = window.piAPI!.onAgentAsk((ask: AgentAsk, chatId) => {
       if (!ask || !ask.id) return
-      setPendingAsk(ask)
+      runtimeOf(cidOf(chatId)).ask = ask
+      bump()
     })
 
     // Agent 自己退出计划模式（计划获批）时同步开关。
     // 这里只改本地状态、不回推 IPC —— 回推会形成 setPlanMode 的来回死循环。
+    // 计划模式是窗口级开关（不按会话区分），所以忽略 chatId。
     cleanupPlanMode = window.piAPI!.onAgentPlanMode((enabled: boolean) => {
       if (useAppStore.getState().planMode !== enabled) {
         useAppStore.setState({ planMode: enabled })
@@ -344,38 +438,62 @@ export default function RightPanel() {
     })
 
     // 真实 token 用量：Agent 每轮请求从 API 的 usage 里取，直接显示，不再模拟
-    cleanupUsage = window.piAPI!.onAgentUsage((u) => {
-      setTokenUsage({
+    cleanupUsage = window.piAPI!.onAgentUsage((u, chatId) => {
+      runtimeOf(cidOf(chatId)).usage = {
         inputTokens: u.inputTokens || 0,
         outputTokens: u.outputTokens || 0,
         inputLimit: u.inputLimit || 0,
         contextWindow: u.contextWindow || 0,
         tokensPerSecond: u.tokensPerSecond || 0,
         live: Boolean(u.live),
-      })
+      }
+      bump()
     })
 
-    cleanupStatus = window.piAPI!.onAgentStatus((status) => {
+    // 服务端报错说出了真实的上下文上限（配置的 200000，实际 60160）：
+    // 把 store 里的模型配置改过来并持久化，否则下一条消息又会带着旧值覆盖回去。
+    // 匹配用 provider + name + baseUrl 三元组 —— 这正是 AgentModelConfig 的身份。
+    cleanupModelFix = window.piAPI!.onModelCorrected((fix) => {
+      if (!fix || !fix.contextWindow) return
+      const store = useAppStore.getState()
+      const target = store.models.find((m) =>
+        m.provider === fix.provider
+        && m.name === fix.model
+        && (m.baseUrl || '') === (fix.baseUrl || '')
+      )
+      if (!target || target.contextWindow === fix.contextWindow) return
+      const patch: Partial<Model> = { contextWindow: fix.contextWindow }
+      if (fix.maxInputTokens && target.maxInputTokens) patch.maxInputTokens = fix.maxInputTokens
+      store.updateModel(target.id, patch)
+      showNotice(`「${target.displayName || target.name}」上下文上限已纠正为 ${fix.contextWindow} tokens`)
+    })
+
+    cleanupStatus = window.piAPI!.onAgentStatus((status, chatId) => {
       if (status.state === 'idle') return
+      const r = runtimeOf(cidOf(chatId))
       // 任务被中断时挂起的提问已经作废，把卡片收掉，否则会一直停在那里
-      if (status.state === 'interrupted') setPendingAsk(null)
+      if (status.state === 'interrupted') r.ask = null
       // 新一轮开始：本轮正文要重新累积
-      if (status.state === 'thinking' || status.state === 'thinking_output') setLiveContent('')
+      if (status.state === 'thinking' || status.state === 'thinking_output') r.liveContent = ''
       // 过程记录：工具动作、提问、清单更新、扩展通知、长命令的实时输出都进时间线；
       // tool_output / tool_end 不是新动作，只是回填在跑的那一条，由 appendStatusEvent 处理
-      setProcessEvents((prev) => appendStatusEvent(prev, status))
+      r.events = appendStatusEvent(r.events, status)
       // 工具动作之后模型的推理要新开一张思考卡，不能接在动作之前那一段后面
       if (isTimelineState(status.state) || status.state === 'thinking_output' || status.state === 'notice') {
-        newThinkingRef.current = true
+        r.newThinking = true
       }
-      // 只进时间线、不代表当前状态的事件不动顶部状态条
-      if (status.state === 'tool_output' || status.state === 'tool_end' || status.state === 'notice') return
-      setAgentStatus({ state: status.state, detail: status.detail })
+      // 只进时间线、不代表当前状态的事件不动状态条
+      if (status.state !== 'tool_output' && status.state !== 'tool_end' && status.state !== 'notice') {
+        r.status = { state: status.state, detail: status.detail }
+      }
+      bump()
     })
 
-    cleanupResp = window.piAPI!.onAgentResponse((data: string) => {
-      const durationMs = taskStartRef.current ? Date.now() - taskStartRef.current : 0
-      const events = processEventsRef.current
+    cleanupResp = window.piAPI!.onAgentResponse((data: string, chatId) => {
+      const tabId = cidOf(chatId)
+      const r = runtimeOf(tabId)
+      const durationMs = r.startedAt ? Date.now() - r.startedAt : 0
+      const events = r.events
       const response: Message = {
         id: Date.now().toString(),
         role: 'assistant',
@@ -384,22 +502,24 @@ export default function RightPanel() {
         status: 'done',
         process: events.length > 0 ? { events, durationMs } : undefined,
       }
-      const tabId = activeTabIdRef.current
       setTabs((prev) => prev.map((t) =>
         t.id === tabId
           ? { ...t, messages: [...t.messages, response] }
           : t
       ))
-      // 重置状态
-      setProcessEvents([])
-      setLiveContent('')
-      newThinkingRef.current = false
-      setPendingAsk(null)
-      setAgentStatus({ state: 'done' })
+      // 重置这个会话的运行态
+      r.events = []
+      r.liveContent = ''
+      r.newThinking = false
+      r.ask = null
+      r.status = { state: 'done' }
+      bump()
       setTimeout(() => {
-        setAgentStatus({ state: 'idle' })
-        setRunning(false)
-        processQueue()
+        r.status = { state: 'idle' }
+        r.running = false
+        bump()
+        // 这个会话自己排的队，下一棒交给它自己（不打扰别的会话）
+        processQueueRef.current(tabId)
       }, 300)
     })
 
@@ -413,11 +533,21 @@ export default function RightPanel() {
       cleanupTodos?.()
       cleanupPlanMode?.()
       cleanupUsage?.()
+      cleanupModelFix?.()
     }
-  }, [isElectron]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [isElectron, runtimeOf, bump]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  const handleSend = async (overrideText?: string) => {
-    const raw = (overrideText ?? input).trim()
+  const handleSend = async (
+    overrideText?: string,
+    targetChatId?: string,
+    overrideAttachments?: QueuedMessage['attachments'],
+  ) => {
+    const tabId = targetChatId || activeTabId
+    const isActive = tabId === activeTabId
+    // 只有「从当前输入框直接发」才动输入框；处理队列消息时输入框属于别的会话，不能碰
+    const raw = (overrideText ?? (isActive ? input : '')).trim()
+    // 队列里的消息自带附件；直接发送用输入框里的附件
+    const sendAttachments = overrideAttachments ?? (overrideText ? undefined : attachments)
     if (!raw) return
 
     // 没打开工作区就发任务：Agent 的文件工具、检查点、会话隔离都挂在「工作目录」上，
@@ -428,56 +558,57 @@ export default function RightPanel() {
       return
     }
 
-    const text = raw
-
-    const sendText = text
-    const sendAttachments = overrideText ? undefined : attachments
-    setInput('')
-    setAttachments([])
-
-    // 自动命名任务：首次发送时用内容摘要命名
-    const tab = tabs.find((t) => t.id === activeTabId)
-    if (tab && tab.messages.length === 0) {
-      const name = text.length > 20 ? text.slice(0, 20) + '…' : text
-      setTabs((prev) => prev.map((t) => t.id === activeTabId ? { ...t, title: name } : t))
+    if (isActive && overrideText === undefined) {
+      setInput('')
+      setAttachments([])
     }
 
-    if (isRunning) {
-      enqueueMessage({
-        id: Date.now().toString(),
-        content: sendText,
-        tabId: activeTabId,
-        attachments: sendAttachments,
-      })
+    const r = runtimeOf(tabId)
+
+    // 自动命名任务：首次发送时用内容摘要命名
+    const tab = tabsRef.current.find((t) => t.id === tabId)
+    if (tab && tab.messages.length === 0) {
+      const name = raw.length > 20 ? raw.slice(0, 20) + '…' : raw
+      setTabs((prev) => prev.map((t) => t.id === tabId ? { ...t, title: name } : t))
+    }
+
+    // 这个会话已经在跑：排进它自己的队列，等它本轮结束再发（别的会话不受影响）
+    if (r.running) {
+      r.queue = [...r.queue, { id: Date.now().toString(), content: raw, tabId, attachments: sendAttachments }]
+      bump()
       return
     }
 
-    setRunning(true)
+    r.running = true
+    r.startedAt = Date.now()
+    r.liveContent = ''
+    r.newThinking = false
+    r.usage = { ...r.usage, inputTokens: 0, outputTokens: 0, tokensPerSecond: 0, live: false }
     // 自己发了新任务：无论之前停在哪段历史，都回到最新
-    autoFollowRef.current = true
-    setTokenUsage({ inputTokens: 0, outputTokens: 0, tokensPerSecond: 0, live: false })
-    taskStartRef.current = Date.now()
-    setLiveContent('')
-    newThinkingRef.current = false
+    if (isActive) autoFollowRef.current = true
 
     const userMsg: Message = {
       id: Date.now().toString(),
       role: 'user',
-      content: sendText,
+      content: raw,
       timestamp: Date.now(),
       attachments: sendAttachments,
     }
 
     setTabs((prev) => prev.map((t) =>
-      t.id === activeTabId ? { ...t, messages: [...t.messages, userMsg] } : t
+      t.id === tabId ? { ...t, messages: [...t.messages, userMsg] } : t
     ))
 
     // Electron 模式：调用真实 agent
     if (isElectron) {
-      setProcessEvents([])
-      setAgentStatus({ state: 'thinking', detail: '正在调用模型...' })
+      r.events = []
+      r.status = { state: 'thinking', detail: '正在调用模型...' }
+      bump()
       try {
-        await window.piAPI!.sendToAgent(sendText)
+        // 模型随消息一起带上：按这个会话绑定的模型跑，
+        // 同一窗口里 A 会话用 A 模型、B 会话用 B 模型互不影响。
+        const boundModel = modelForTab(tabId)
+        await window.piAPI!.sendToAgent(raw, tabId, boundModel ? toModelPayload(boundModel) : undefined)
         // 响应通过 onAgentResponse 回调处理
       } catch (err) {
         const errMsg: Message = {
@@ -488,10 +619,11 @@ export default function RightPanel() {
           status: 'done',
         }
         setTabs((prev) => prev.map((t) =>
-          t.id === activeTabId ? { ...t, messages: [...t.messages, errMsg] } : t
+          t.id === tabId ? { ...t, messages: [...t.messages, errMsg] } : t
         ))
-        setAgentStatus({ state: 'idle' })
-        setRunning(false)
+        r.status = { state: 'idle' }
+        r.running = false
+        bump()
       }
       return
     }
@@ -500,14 +632,17 @@ export default function RightPanel() {
     const controller = new AbortController()
     abortRef.current = controller
 
-    if (!activeModel) {
-      setAgentStatus({ state: 'idle' })
-      setRunning(false)
+    const tabModel = modelForTab(tabId)
+    if (!tabModel) {
+      r.status = { state: 'idle' }
+      r.running = false
+      bump()
       return
     }
 
-    setProcessEvents([])
-    setAgentStatus({ state: 'thinking', detail: '调用模型...' })
+    r.events = []
+    r.status = { state: 'thinking', detail: '调用模型...' }
+    bump()
     try {
       // 浏览器模式走 Vite 代理避免 CORS
       const apiUrl = `/api-proxy/chat/completions`
@@ -515,11 +650,11 @@ export default function RightPanel() {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${activeModel.apiKey}`,
+          'Authorization': `Bearer ${tabModel.apiKey}`,
         },
         body: JSON.stringify({
-          model: activeModel.name,
-          messages: [{ role: 'user', content: sendText }],
+          model: tabModel.name,
+          messages: [{ role: 'user', content: raw }],
         }),
         signal: controller.signal,
       })
@@ -534,16 +669,16 @@ export default function RightPanel() {
         status: 'done',
       }
       setTabs((prev) => prev.map((t) =>
-        t.id === activeTabId ? { ...t, messages: [...t.messages, response] } : t
+        t.id === tabId ? { ...t, messages: [...t.messages, response] } : t
       ))
-      setTokenUsage({
+      r.usage = {
         inputTokens: data.usage?.prompt_tokens || data.usage?.total_tokens || 0,
         outputTokens: data.usage?.completion_tokens || 0,
-        inputLimit: activeModel?.maxInputTokens || activeModel?.contextWindow || 0,
-        contextWindow: activeModel?.contextWindow || 0,
+        inputLimit: tabModel.maxInputTokens || tabModel.contextWindow || 0,
+        contextWindow: tabModel.contextWindow || 0,
         tokensPerSecond: 0,
         live: false,
-      })
+      }
     } catch (err) {
       const errMsg: Message = {
         id: (Date.now() + 1).toString(),
@@ -553,39 +688,57 @@ export default function RightPanel() {
         status: 'done',
       }
       setTabs((prev) => prev.map((t) =>
-        t.id === activeTabId ? { ...t, messages: [...t.messages, errMsg] } : t
+        t.id === tabId ? { ...t, messages: [...t.messages, errMsg] } : t
       ))
     }
-    setAgentStatus({ state: 'idle' })
-    setRunning(false)
-    processQueue()
+    r.status = { state: 'idle' }
+    r.running = false
+    bump()
+    processQueue(tabId)
   }
+  handleSendRef.current = handleSend
 
-  // 中断当前本地会话
+  // 中断当前显示的会话（后台会话不受影响）
   const handleInterrupt = async () => {
     try {
-      await window.piAPI?.interruptAgent?.()
+      await window.piAPI?.interruptAgent?.(activeTabId)
     } catch { /* 忽略中断异常 */ }
   }
 
   // 回答 ask_user 的提问：回填给 Agent（它会接着往下跑），并把这次问答记进时间线
   const handleAnswer = async (answer: string) => {
-    const ask = pendingAsk
+    const r = runtimeOf(activeTabId)
+    const ask = r.ask
     if (!ask) return
-    setPendingAsk(null)
-    setProcessEvents((prev) => [...prev, { kind: 'text', text: `已回答：${answer}` }])
+    r.ask = null
+    r.events = [...r.events, { kind: 'text', text: `已回答：${answer}` }]
+    bump()
     try {
-      await window.piAPI?.answerAgent?.(ask.id, answer)
+      await window.piAPI?.answerAgent?.(ask.id, answer, activeTabId)
     } catch { /* 回填失败时，Agent 会在中断或结束时自行放行 */ }
   }
 
-  const processQueue = () => {
-    const store = useAppStore.getState()
-    if (store.queue.length > 0 && !store.isRunning) {
-      const next = store.queue[0]
-      store.dequeueMessage(next.id)
-      handleSend(next.content)
-    }
+  // 消费某个会话自己的队列：一个会话跑完，接着跑它自己排的下一条。
+  // 队列按会话隔离，所以一个会话在排队不会挡住别的会话。
+  const processQueue = (chatId: string) => {
+    const r = runtimeOf(chatId)
+    if (r.queue.length === 0 || r.running) return
+    const next = r.queue[0]
+    r.queue = r.queue.slice(1)
+    bump()
+    handleSendRef.current(next.content, chatId, next.attachments)
+  }
+  processQueueRef.current = processQueue
+
+  const clearQueue = (chatId: string) => {
+    runtimeOf(chatId).queue = []
+    bump()
+  }
+
+  const removeQueued = (chatId: string, id: string) => {
+    const r = runtimeOf(chatId)
+    r.queue = r.queue.filter((q) => q.id !== id)
+    bump()
   }
 
   const handleEditMessage = (msg: Message) => {
@@ -730,8 +883,8 @@ export default function RightPanel() {
 
   // 上下文占用比例：分子是 API 报的真实 prompt_tokens（不是本地估算），
   // 分母优先用输入上限（maxInputTokens 比 contextWindow 更贴近真实可用量）
-  const ctxLimit = tokenUsage.inputLimit || activeModel?.maxInputTokens || activeModel?.contextWindow || 0
-  const ctxPct = ctxLimit > 0 ? Math.min(100, Math.round((tokenUsage.inputTokens / ctxLimit) * 100)) : 0
+  const ctxLimit = rt.usage.inputLimit || activeModel?.maxInputTokens || activeModel?.contextWindow || 0
+  const ctxPct = ctxLimit > 0 ? Math.min(100, Math.round((rt.usage.inputTokens / ctxLimit) * 100)) : 0
 
   return (
     <div className="h-full flex flex-col bg-pi-bg overflow-hidden">
@@ -775,6 +928,9 @@ export default function RightPanel() {
                     }`}
                   >
                     {tab.title}
+                    {runtimeOf(tab.id).running && (
+                      <span className="inline-block w-1.5 h-1.5 rounded-full bg-pi-accent pulse-dot ml-1.5 align-middle" title="正在运行" />
+                    )}
                     {tab.messages.length > 0 && <span className="text-pi-text-dim ml-1.5">({tab.messages.length})</span>}
                   </button>
                   {tabs.length > 1 && (
@@ -817,11 +973,11 @@ export default function RightPanel() {
                 onCancelEdit={() => setEditingMessage(null)}
               />
             ))}
-            {isRunning && agentStatus.state !== 'done' && agentStatus.state !== 'idle' && (
+            {isRunning && rt.status.state !== 'done' && rt.status.state !== 'idle' && (
               <RunningProcess
-                status={agentStatus}
-                events={processEvents}
-                liveContent={liveContent}
+                status={rt.status}
+                events={rt.events}
+                liveContent={rt.liveContent}
               />
             )}
             <div ref={bottomRef} />
@@ -829,24 +985,24 @@ export default function RightPanel() {
         )}
       </div>
 
-      {/* Queue display */}
-      {queue.length > 0 && (
+      {/* Queue display：只显示当前会话自己的排队（各会话队列互相独立） */}
+      {rt.queue.length > 0 && (
         <div className="border-t border-pi-border bg-pi-surface/50 px-3 py-2 shrink-0 max-h-24 overflow-y-auto">
           <div className="flex items-center gap-2 mb-1">
-            <span className="text-[10px] font-medium text-pi-text-muted">排队中 ({queue.length})</span>
+            <span className="text-[10px] font-medium text-pi-text-muted">排队中 ({rt.queue.length})</span>
             <button
-              onClick={() => useAppStore.getState().clearQueue()}
+              onClick={() => clearQueue(activeTab.id)}
               className="text-[9px] text-pi-text-dim hover:text-red-400"
             >
               清空
             </button>
           </div>
-          {queue.map((q, idx) => (
+          {rt.queue.map((q, idx) => (
             <div key={q.id} className="flex items-center gap-2 py-0.5 group/queue">
               <span className="text-[9px] text-pi-text-dim w-4">{idx + 1}.</span>
               <span className="text-[11px] text-pi-text-muted truncate flex-1">{q.content}</span>
               <button
-                onClick={() => dequeueMessage(q.id)}
+                onClick={() => removeQueued(activeTab.id, q.id)}
                 className="text-[9px] text-pi-text-dim opacity-0 group-hover/queue:opacity-100 hover:text-red-400"
               >
                 移除
@@ -857,15 +1013,15 @@ export default function RightPanel() {
       )}
 
       {/* 任务清单：多步任务的进度，先于提问显示，用户一眼看到还剩几件 */}
-      <TodoPanel todos={todos} />
+      <TodoPanel todos={rt.todos} />
 
       {/* ask_user 的提问：Agent 正卡在等这个回答，钉在输入框上方避免被忽略 */}
-      {pendingAsk && <AskUserCard ask={pendingAsk} onAnswer={handleAnswer} />}
+      {rt.ask && <AskUserCard ask={rt.ask} onAnswer={handleAnswer} />}
 
       {/* Input area */}
       <div className="border-t border-pi-border p-2.5 pt-1.5 shrink-0">
         {/* 真实用量：输入 / 输出 / 上下文占用 / 速度，来自 API 的 usage */}
-        <UsageLine usage={tokenUsage} />
+        <UsageLine usage={rt.usage} />
 
         {/* Attachment preview */}
         {attachments.length > 0 && (
@@ -939,9 +1095,15 @@ export default function RightPanel() {
                     {models.map((m) => (
                       <button
                         key={m.id}
-                        onClick={() => { setActiveModel(m.id); setShowModelSelect(false) }}
+                        onClick={() => {
+                          // 绑定到「当前这个会话」，别的会话用什么模型不受影响
+                          setTabs((prev) => prev.map((t) => t.id === activeTabId ? { ...t, modelId: m.id } : t))
+                          // 同时作为窗口默认：新会话不选就用它（想各用各的，再逐个改即可）
+                          setActiveModel(m.id)
+                          setShowModelSelect(false)
+                        }}
                         className={`w-full text-left px-3 py-1.5 text-[11px] hover:bg-pi-hover transition-colors ${
-                          activeModelId === m.id ? 'text-pi-accent' : 'text-pi-text'
+                          activeModel?.id === m.id ? 'text-pi-accent' : 'text-pi-text'
                         }`}
                       >
                         {m.displayName}

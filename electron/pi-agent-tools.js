@@ -22,10 +22,12 @@ const TOOL_STATUS = {
   edit: (a) => ({ state: 'editing', detail: `编辑: ${firstString(a.path, a.file_path, a.file)}` }),
   multiedit: (a) => ({ state: 'editing', detail: `多处编辑: ${firstString(a.path, a.file_path, a.file)}` }),
   apply_patch: () => ({ state: 'editing', detail: '应用补丁' }),
-  bash: (a) => ({ state: 'executing', detail: `执行: ${firstString(a.command).slice(0, 50)}` }),
-  powershell: (a) => ({ state: 'executing', detail: `执行: ${firstString(a.command).slice(0, 50)}` }),
+  // detail 里的命令截断到 50 字符是给时间线紧凑显示用的；command 保留全文，
+  // 界面的「复制命令」按钮要拿它 —— 复制到半截命令没有意义。
+  bash: (a) => ({ state: 'executing', detail: `执行: ${firstString(a.command).slice(0, 50)}`, command: firstString(a.command) }),
+  powershell: (a) => ({ state: 'executing', detail: `执行: ${firstString(a.command).slice(0, 50)}`, command: firstString(a.command) }),
   // 后台任务三件套（electron/pi-custom-extensions.js 装的那个扩展提供的工具）
-  run_in_background: (a) => ({ state: 'executing', detail: `后台启动: ${firstString(a.command).slice(0, 50)}` }),
+  run_in_background: (a) => ({ state: 'executing', detail: `后台启动: ${firstString(a.command).slice(0, 50)}`, command: firstString(a.command) }),
   bash_output: (a) => ({ state: 'executing', detail: `后台输出: ${firstString(a.job_id) || '全部任务'}` }),
   kill_shell: (a) => ({ state: 'executing', detail: `停止后台任务: ${firstString(a.job_id)}` }),
   // 项目全局规则（同一个安装器装的 yu-code-rules.ts 提供的工具）

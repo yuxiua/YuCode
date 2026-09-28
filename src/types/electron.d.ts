@@ -2,6 +2,20 @@ import type { InstalledExtension, ExtensionCatalogItem, PiRuntimeInfo, FileDiff,
 
 export {}
 
+/** 下发给主进程做模型登记的配置（每个会话各存一份，所以会话之间可以各用各的模型） */
+export interface AgentModelConfig {
+  provider: string
+  model: string
+  apiKey: string
+  baseUrl: string
+  contextWindow: number
+  maxInputTokens: number
+  maxOutputTokens: number
+  supportsMultimodal: boolean
+  disableThinking?: boolean
+  thinkingControl?: 'qwen' | 'openai' | 'deepseek' | 'none'
+}
+
 declare global {
   interface Window {
     piAPI: {
@@ -31,7 +45,9 @@ declare global {
       openFolderDialog: () => Promise<string | null>
       openFileDialog: () => Promise<string | null>
       createFile: () => Promise<string | null>
-      openFolder: () => Promise<string | null>
+      /** 菜单「打开文件夹」：选目录并在新窗口打开（原窗口保持不变）；
+       *  目录已打开时聚焦原窗口（opened='focused'），否则新建（opened='created'） */
+      openFolderInNewWindow: () => Promise<{ ok: boolean; dir?: string; opened?: 'focused' | 'created' } | null>
 
       // Python environments
       listPythonEnvs: () => Promise<{ name: string; path: string; version?: string }[]>
@@ -72,16 +88,18 @@ declare global {
       browserScreenshot: () => Promise<{ success: boolean; path?: string; error?: string }>
       browserClose: () => Promise<{ success: boolean }>
 
-      // Agent
-      sendToAgent: (message: string) => Promise<void>
-      setAgentModel: (config: { provider: string; model: string; apiKey: string; baseUrl: string; contextWindow: number; maxInputTokens: number; maxOutputTokens: number; supportsMultimodal: boolean; disableThinking?: boolean; thinkingControl?: 'qwen' | 'openai' | 'deepseek' | 'none' }) => Promise<void>
+      // Agent（chatId 指明窗口内的哪个会话，支持同窗口多会话并发）
+      /** 发消息；model 是该会话绑定的模型配置（不同会话可以用不同模型） */
+      sendToAgent: (message: string, chatId?: string, model?: AgentModelConfig) => Promise<void>
+      /** 下发模型：带 chatId 只作用于该会话，不带则作为窗口默认广播给全部会话 */
+      setAgentModel: (config: AgentModelConfig, chatId?: string) => Promise<void>
       /** 模型自测：返回「登记到 Pi / 端点连通 / Pi 可识别」三步的逐步结果 */
       testModel: (config: { provider: string; model: string; displayName?: string; apiKey?: string; baseUrl: string; contextWindow?: number; maxOutputTokens?: number; disableThinking?: boolean; thinkingControl?: 'qwen' | 'openai' | 'deepseek' | 'none' }) => Promise<{
         ok: boolean
         steps: { name: string; ok: boolean; detail: string }[]
       }>
-      onAgentResponse: (callback: (data: string) => void) => () => void
-      onAgentStatus: (callback: (status: AgentStatusEvent) => void) => () => void
+      onAgentResponse: (callback: (data: string, chatId?: string) => void) => () => void
+      onAgentStatus: (callback: (status: AgentStatusEvent, chatId?: string) => void) => () => void
       /** 真实 token 用量（API usage）：输入 / 输出 / 上限 / 速度 */
       onAgentUsage: (callback: (usage: {
         inputTokens: number
@@ -90,19 +108,27 @@ declare global {
         inputLimit: number
         contextWindow: number
         live: boolean
-      }) => void) => () => void
+      }, chatId?: string) => void) => () => void
+      /** 服务端报出真实的上下文上限：界面要把模型配置的 contextWindow 改过来并持久化 */
+      onModelCorrected: (callback: (fix: {
+        provider: string
+        model: string
+        baseUrl: string
+        contextWindow: number
+        maxInputTokens: number
+      }, chatId?: string) => void) => () => void
       /** 流式增量：思考过程 / 正文 */
-      onAgentStream: (callback: (delta: { type: 'reasoning' | 'content'; text: string }) => void) => () => void
+      onAgentStream: (callback: (delta: { type: 'reasoning' | 'content'; text: string }, chatId?: string) => void) => () => void
       /** 每次文件改动推来的 diff */
-      onAgentDiff: (callback: (diff: FileDiff) => void) => () => void
+      onAgentDiff: (callback: (diff: FileDiff, chatId?: string) => void) => () => void
       /** Agent 用 ask_user 提问 */
-      onAgentAsk: (callback: (ask: AgentAsk) => void) => () => void
-      /** 回答 ask_user 的提问 */
-      answerAgent: (id: string, answer: string) => Promise<{ success: boolean }>
+      onAgentAsk: (callback: (ask: AgentAsk, chatId?: string) => void) => () => void
+      /** 回答 ask_user 的提问（chatId 指明是哪个会话在问） */
+      answerAgent: (id: string, answer: string, chatId?: string) => Promise<{ success: boolean }>
       /** ctrl+左键跳转定义：优先 LSP 语义定义，拿不到再按名字扫工程（相对路径） */
       findSymbol: (name: string, at?: { filePath: string; line: number; column: number }) => Promise<SymbolHit[]>
-      /** 中断当前执行 */
-      interruptAgent: () => Promise<{ success: boolean }>
+      /** 中断指定会话的执行（chatId 指明是哪个会话） */
+      interruptAgent: (chatId?: string) => Promise<{ success: boolean }>
       /** 设置 Agent 的工作目录（跟随左侧资源管理器） */
       setAgentProjectDir: (dirPath: string) => Promise<{ success: boolean }>
       /** 同步已启用且已安装的 Skill（正文会注入到 Agent 系统提示词，真正影响其行为） */
@@ -110,7 +136,7 @@ declare global {
       /** 计划模式：开启后 Agent 只读不改，先出计划再动手 */
       setPlanMode: (enabled: boolean) => Promise<{ success: boolean; planMode: boolean }>
       /** Agent 自己切换计划模式（计划获批后自动退出），界面据此同步开关 */
-      onAgentPlanMode: (callback: (enabled: boolean) => void) => () => void
+      onAgentPlanMode: (callback: (enabled: boolean, chatId?: string) => void) => () => void
       /** 护栏命中时是先弹卡问用户（true）还是直接拦下（false） */
       setRiskConfirm: (enabled: boolean) => Promise<{ success: boolean; askBeforeRisk: boolean }>
       /** 改完文件是否自动把诊断结果回灌给 Agent */
@@ -119,7 +145,7 @@ declare global {
        *  chatId 是聊天标签 id：Pi 后端按「目录 + 标签」对应一个 pi 会话 */
       loadAgentContext: (messages: { role: string; content: string }[], chatId?: string) => Promise<{ success: boolean }>
       /** Agent 的任务清单，界面实时展示进度 */
-      onAgentTodos: (callback: (todos: AgentTodo[]) => void) => () => void
+      onAgentTodos: (callback: (todos: AgentTodo[], chatId?: string) => void) => () => void
       /** 内置能力清单：已原生生效、不依赖 Pi 扩展的那些 */
       listBuiltins: () => Promise<BuiltinCapabilities>
       /** 改动检查点：列出 / 回退到某个快照 */
@@ -132,7 +158,7 @@ declare global {
         error?: string
       }>
       /** Agent 每轮任务开始前打下的检查点（用于提示「改坏了能回退」） */
-      onAgentCheckpoint: (callback: (cp: { sha: string; at: number }) => void) => () => void
+      onAgentCheckpoint: (callback: (cp: { sha: string; at: number }, chatId?: string) => void) => () => void
       /** 编辑历史消息重跑前，把 Agent 的对话上下文退回那条消息之前。
        *  Pi 后端按 forkText / forkIndex 分叉会话，自研后端按 messages 整段替换 */
       rewindAgent: (payload: {

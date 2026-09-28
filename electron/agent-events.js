@@ -58,7 +58,7 @@ const events = {
       read_file: { state: 'reading', detail: `读取: ${args.file_path}` },
       write_file: { state: 'editing', detail: `写入: ${args.file_path}` },
       edit_file: { state: 'editing', detail: `编辑: ${args.file_path}` },
-      execute_command: { state: 'executing', detail: `执行: ${args.command?.slice(0, 50) || ''}` },
+      execute_command: { state: 'executing', detail: `执行: ${args.command?.slice(0, 50) || ''}`, command: args.command },
       list_directory: { state: 'searching', detail: `列目录: ${args.directory || '/'}` },
       ask_user: { state: 'asking', detail: String(args.question || '').slice(0, 80) },
       web_search: { state: 'web_searching', detail: `联网搜索: ${args.query || ''}` },
@@ -130,6 +130,12 @@ const events = {
   /** 真实 token 用量：输入 / 输出 / 上限 / 速度。界面显示成 pi 那行 ↑↓ 就是它 */
   sendUsage(payload) {
     emit(this, 'agent:usage', payload)
+  },
+
+  /** 服务端报出真实上下文上限后回推给界面，让 store 里的模型配置也改过来并持久化，
+   *  否则下一条消息又会带着旧的（虚大的）contextWindow 把纠正覆盖回去 */
+  sendModelCorrected(payload) {
+    emit(this, 'agent:model-corrected', payload)
   },
 }
 
